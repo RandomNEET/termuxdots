@@ -11,6 +11,7 @@ figlet
 file
 fzf
 git
+gnupg
 htop
 imagemagick
 jq
