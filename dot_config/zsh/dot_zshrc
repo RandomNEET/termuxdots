@@ -1,0 +1,22 @@
+_try_source() { [[ -f "$1" ]] && source "$1"; }
+
+[[ -f "$ZDOTDIR/core.zsh" ]] && source "$ZDOTDIR/core.zsh"
+
+# zsh-vi-mode (must load first — it owns the vi keymap system)
+_try_source "$ZDOTDIR/init-zvm.zsh"
+
+_try_source "$ZDOTDIR/init-autosuggestions.zsh"
+_try_source "$ZDOTDIR/init-starship.zsh"
+_try_source "$ZDOTDIR/init-zoxide.zsh"
+_try_source "$ZDOTDIR/init-fzf.zsh"
+_try_source "$ZDOTDIR/init-eza.zsh"
+_try_source "$ZDOTDIR/init-yazi.zsh"
+_try_source "$ZDOTDIR/init-gpg.zsh"
+_try_source "$ZDOTDIR/init-lazygit.zsh"
+
+_try_source "$ZDOTDIR/aliases.zsh"
+
+# syntax highlighting (must load last)
+_try_source "$ZDOTDIR/init-syntax-highlighting.zsh"
+
+unfunction _try_source

@@ -1,0 +1,19 @@
+[[mgr.prepend_keymap]]
+desc = "Go ~/.config"
+on = ["g", "c"]
+run = "cd ~/.config"
+
+[[mgr.prepend_keymap]]
+desc = "Go ~/dls"
+on = ["g", "d"]
+run = "cd ~/dls"
+
+[[mgr.prepend_keymap]]
+desc = "Go ~/tmp"
+on = ["g", "t"]
+run = "cd ~/tmp"
+
+[[mgr.prepend_keymap]]
+desc = "Go ~/repo"
+on = ["g", "r"]
+run = "cd ~/repo"

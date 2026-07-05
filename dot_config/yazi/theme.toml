@@ -1,0 +1,43 @@
+[[icon.dirs]]
+name = "dsk"
+text = ""
+
+[[icon.dirs]]
+name = "doc"
+text = "󱔗"
+
+[[icon.dirs]]
+name = "dls"
+text = ""
+
+[[icon.dirs]]
+name = "mus"
+text = ""
+
+[[icon.dirs]]
+name = "pic"
+text = ""
+
+[[icon.dirs]]
+name = "pub"
+text = ""
+
+[[icon.dirs]]
+name = "tpl"
+text = ""
+
+[[icon.dirs]]
+name = "vid"
+text = ""
+
+[[icon.dirs]]
+name = "tmp"
+text = "󰪺"
+
+[[icon.dirs]]
+name = "repo"
+text = ""
+
+[[icon.dirs]]
+name = "misc"
+text = "󰮍"

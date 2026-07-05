@@ -1,0 +1,17 @@
+[init]
+  defaultBranch = main
+
+[pull]
+  rebase = true
+
+[push]
+  autoSetupRemote = true
+  default = current
+  
+[commit]
+	gpgsign = true
+  
+[user]
+	name = RandomNEET
+	email = dev@randomneet.me
+	signingkey = 0xBFA119DF465BFBB1

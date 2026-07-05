@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+# Script to sync only existing local subfolders from the remote TLMC repository.
+# Handles special characters like [ ] & and spaces in folder names correctly.
+#
+# Usage:
+#   ./update.sh [OPTIONS] LOCAL_DIR
+#
+# Arguments:
+#   LOCAL_DIR    The local TLMC base directory (e.g., /media/music/tlmc).
+#
+# Options:
+#   -h, --help      Show this help message and exit.
+#   --delete        Delete files inside matched folders that are gone from remote.
+#   -n, --dry-run   Trial run: shows what would be synced without transferring files.
+
+# Default values
+DELETE_FLAG=""
+DRY_RUN_FLAG=""
+LOCAL_DIR=""
+URL="rsync://patchouli@rsync.thdisc.com:874/tlmc"
+export RSYNC_PASSWORD=knowledge
+
+show_help() {
+  grep "^#" "$0" | sed 's/^# \{0,1\}//' | head -n 15
+  exit 0
+}
+
+# Parse arguments
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+  -h | --help) show_help ;;
+  --delete) DELETE_FLAG="--delete" ;;
+  -n | --dry-run) DRY_RUN_FLAG="--dry-run" ;;
+  *)
+    if [ -z "$LOCAL_DIR" ]; then
+      LOCAL_DIR="$1"
+    else
+      echo "Unknown argument: $1"
+      exit 1
+    fi
+    ;;
+  esac
+  shift
+done
+
+if [ -z "$LOCAL_DIR" ] || [ ! -d "$LOCAL_DIR" ]; then
+  echo "Error: Valid LOCAL_DIR is required."
+  exit 1
+fi
+
+# Enter the local directory to scan folders
+# We use full path to avoid any confusion
+LOCAL_DIR=$(realpath "$LOCAL_DIR")
+cd "$LOCAL_DIR" || exit
+
+# Create a temporary filter file
+FILTER_FILE=$(mktemp)
+echo "Generating sync list from: $LOCAL_DIR"
+
+# Step 1: Include the directories themselves (escaped)
+# Step 2: Include everything inside those directories
+# Step 3: Exclude everything else
+for dir in */; do
+  dir="${dir%/}"
+  if [ "$dir" != "*" ]; then
+    # Escape special characters for rsync filter: [ ] * ?
+    # We use a double backslash for the sed replacement to ensure a single backslash ends up in the file
+    safe_dir=$(echo "$dir" | sed 's/\[/\\\[/g; s/\]/\\\]/g; s/\*/\\\*/g; s/\?/\\\?/g')
+    echo "+ /$safe_dir/" >>"$FILTER_FILE"
+    echo "+ /$safe_dir/**" >>"$FILTER_FILE"
+  fi
+done
+
+# Exclude all other top-level items
+echo "- /*" >>"$FILTER_FILE"
+
+echo "Starting synchronization for existing artists only..."
+if [ -n "$DRY_RUN_FLAG" ]; then echo "[MODE: DRY RUN]"; fi
+if [ -n "$DELETE_FLAG" ]; then echo "[MODE: DELETE ENABLED]"; fi
+
+# Execute rsync-ssl
+# Using -r (recursive) and other -a (archive) flags
+rsync-ssl -avz $DELETE_FLAG $DRY_RUN_FLAG --progress \
+  --filter=". $FILTER_FILE" \
+  "$URL/" "$LOCAL_DIR/"
+
+# Cleanup
+rm "$FILTER_FILE"
+
+echo "Process finished."

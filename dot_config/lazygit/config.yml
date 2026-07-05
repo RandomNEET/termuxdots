@@ -1,0 +1,32 @@
+git:
+  overrideGpg: true
+  paging:
+    - colorArg: always
+      pager: delta --dark --paging=never
+  parseEmoji: true
+gui:
+  nerdFontsVersion: "3"
+  theme:
+    activeBorderColor:
+      - "#89b4fa"
+      - bold
+    cherryPickedCommitBgColor:
+      - "#45475a"
+    cherryPickedCommitFgColor:
+      - "#6c7086"
+    defaultFgColor:
+      - "#cdd6f4"
+    inactiveBorderColor:
+      - "#6c7086"
+    optionsTextColor:
+      - "#f5e0dc"
+    searchingActiveBorderColor:
+      - "#a6adc8"
+      - bold
+    selectedLineBgColor:
+      - "#6c7086"
+    unstagedChangesColor:
+      - "#f38ba8"
+os:
+  disableStartupPopups: true
+  editPreset: nvim
