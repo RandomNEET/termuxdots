@@ -138,12 +138,6 @@ for pair in \
   fi
 done
 
-# scripts
-step "Fixing script permissions"
-
-find "$HOME/.local/bin" -maxdepth 1 -type f ! -executable \
-  -exec chmod +x {} \; -printf '  +x  %p\n'
-
 # font
 step "Installing font"
 
