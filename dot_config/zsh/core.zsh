@@ -31,3 +31,10 @@ for opt in "${set_opts[@]}"; do
   setopt "$opt"
 done
 unset opt set_opts
+
+# Preferred editor for local and remote sessions
+if [[ -n $SSH_CONNECTION ]]; then
+  export EDITOR='vim'
+else
+  export EDITOR='nvim'
+fi
