@@ -19,6 +19,7 @@ neovim
 pass
 pass-otp
 ripgrep
+rsync
 shfmt
 starship
 stylua
