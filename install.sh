@@ -166,5 +166,4 @@ MOTDEOF
 info "MOTD written to $MOTD_FILE"
 
 # done
-termux-reload-settings
 echo -e "${GREEN}  dotfiles ready.${NC}"
