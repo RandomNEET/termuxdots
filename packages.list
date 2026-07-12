@@ -3,12 +3,14 @@ bat
 chezmoi
 cmatrix
 cowsay
+cuetools
 eza
 fastfetch
 fd
 ffmpeg
 figlet
 file
+flac
 fzf
 git
 gnupg
@@ -22,6 +24,7 @@ pass-otp
 ripgrep
 rsync
 shfmt
+shntool
 starship
 stylua
 yazi

@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
 
-# Script to sync only existing local subfolders from the remote TLMC repository.
-# Handles special characters like [ ] & and spaces in folder names correctly.
+# Script to sync only existing local subfolders from the remote TLMC repository
+# Handles special characters like [ ] & and spaces in folder names correctly
 #
 # Usage:
 #   ./update.sh [OPTIONS] LOCAL_DIR
 #
 # Arguments:
-#   LOCAL_DIR    The local TLMC base directory (e.g., /media/music/tlmc).
+#   LOCAL_DIR        The local TLMC base directory (e.g., /media/music/tlmc)
 #
 # Options:
-#   -h, --help      Show this help message and exit.
-#   --delete        Delete files inside matched folders that are gone from remote.
-#   -n, --dry-run   Trial run: shows what would be synced without transferring files.
+#   -h, --help       Show this help message and exit
+#   --delete         Delete files inside matched folders that are gone from remote
+#   -n, --dry-run    Trial run: shows what would be synced without transferring files
+#   --split-cue      After sync, split single-flac albums into NN. <title>.flac
 
 # Default values
 DELETE_FLAG=""
 DRY_RUN_FLAG=""
+SPLIT_CUE_FLAG=0
 LOCAL_DIR=""
 URL="rsync://patchouli@rsync.thdisc.com:874/tlmc"
 export RSYNC_PASSWORD=knowledge
 
 show_help() {
-  grep "^#" "$0" | sed 's/^# \{0,1\}//' | head -n 15
+  grep "^#" "$0" | sed 's/^# \{0,1\}//' | head -n 16
   exit 0
 }
 
@@ -32,6 +34,7 @@ while [[ "$#" -gt 0 ]]; do
   -h | --help) show_help ;;
   --delete) DELETE_FLAG="--delete" ;;
   -n | --dry-run) DRY_RUN_FLAG="--dry-run" ;;
+  --split-cue) SPLIT_CUE_FLAG=1 ;;
   *)
     if [ -z "$LOCAL_DIR" ]; then
       LOCAL_DIR="$1"
@@ -87,5 +90,192 @@ rsync-ssl -avz $DELETE_FLAG $DRY_RUN_FLAG --progress \
 
 # Cleanup
 rm "$FILTER_FILE"
+
+# Print "<tracknum>\t<title>" lines from a cue sheet
+parse_cue_tracks() {
+  awk '
+    BEGIN { tn = 0 }
+    /^[[:space:]]*TRACK[[:space:]]+[0-9]+/ {
+      match($0, /[0-9][0-9]*/)
+      tn = substr($0, RSTART, RLENGTH) + 0
+      want_title = 1
+      next
+    }
+    want_title && /^[[:space:]]+TITLE[[:space:]]/ {
+      match($0, /"[^"]*"/)
+      if (RLENGTH > 0) {
+        title = substr($0, RSTART + 1, RLENGTH - 2)
+        printf("%d\t%s\n", tn, title)
+      }
+      want_title = 0
+    }
+  ' "$1"
+}
+
+# Sanitize a string for use as a filename
+sanitize_filename() {
+  local s="$1"
+  s="${s//\//_}"
+  s="${s//\\/_}"
+  s="${s//:/_}"
+  s="${s//\*/_}"
+  s="${s//\?/_}"
+  s="${s//\"/_}"
+  s="${s//</_}"
+  s="${s//>/_}"
+  s="${s//|/_}"
+  s=$(printf '%s' "$s" | tr -d '\000-\037\177')
+  s=$(printf '%s' "$s" | sed 's/^[[:space:].]*//; s/[[:space:].]*$//')
+  printf '%s' "$s"
+}
+
+split_cue_album() {
+  local album_dir="$1"
+  local tracks_dir="${album_dir}/tracks"
+
+  local -a flacs=() cues=()
+  local f
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    flacs+=("$f")
+  done < <(find "$album_dir" -maxdepth 1 -mindepth 1 -type f -iname "*.flac" -print0)
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    cues+=("$f")
+  done < <(find "$album_dir" -maxdepth 1 -mindepth 1 -type f -iname "*.cue" -print0)
+
+  if [ "${#flacs[@]}" -ne 1 ] || [ "${#cues[@]}" -ne 1 ]; then
+    return 0
+  fi
+
+  local source_flac="${flacs[0]}"
+  local source_cue="${cues[0]}"
+  local flac_name
+  flac_name=$(basename "$source_flac")
+
+  # Cue must reference the flac by name
+  if ! grep -qiE "^[[:space:]]*FILE[[:space:]]+\"?[^\"]*${flac_name//./\\.}\"?" "$source_cue"; then
+    return 0
+  fi
+
+  # Skip if tracks/ already has the right number of flacs (use find, not
+  # glob — [ ] in paths). Mismatch → stale partial split, redo it
+  local cue_track_count existing_count=0
+  cue_track_count=$(grep -cE '^[[:space:]]*TRACK[[:space:]]+[0-9]+' "$source_cue")
+  if [ -d "$tracks_dir" ]; then
+    existing_count=$(find "$tracks_dir" -maxdepth 1 -type f -name '*.flac' | wc -l)
+  fi
+  if [ "$existing_count" -eq "$cue_track_count" ] && [ "$cue_track_count" -gt 0 ]; then
+    echo "[split-cue] skip (already split): $album_dir"
+    return 0
+  fi
+  if [ "$existing_count" -gt 0 ]; then
+    echo "[split-cue] stale tracks/ (${existing_count}/${cue_track_count}), redoing"
+    find "$tracks_dir" -maxdepth 1 -type f -name '*.flac' -delete
+  fi
+
+  echo "[split-cue] $album_dir"
+
+  # Extract cover art to a temp file (metaflac --import-picture-from needs a file)
+  local cover_file=""
+  if metaflac --list "$source_flac" 2>/dev/null | grep -q "type: 6"; then
+    cover_file=$(mktemp --suffix=.tlmc-cover)
+    if ! metaflac --export-picture-to="$cover_file" "$source_flac" 2>/dev/null; then
+      rm -f "$cover_file"
+      cover_file=""
+    fi
+  fi
+
+  mkdir -p "$tracks_dir"
+
+  # Split: cuebreakpoints | shnsplit. -o "flac ext=flac" forces FLAC output
+  # despite the cue's "FILE ... WAVE" line
+  local split_log
+  split_log=$(mktemp)
+  if ! cuebreakpoints "$source_cue" 2>"$split_log" |
+    shnsplit -O always -d "$tracks_dir" -a "track" \
+      -o "flac ext=flac" "$source_flac" \
+      >>"$split_log" 2>&1; then
+    echo "[split-cue]   ERROR: split failed for $album_dir" >&2
+    cat "$split_log" >&2
+    rm -f "$split_log" "$cover_file"
+    return 1
+  fi
+  rm -f "$split_log"
+
+  # Tag from cue. Stderr dropped — non-UTF-8 REM DATE lines make cuetag.sh
+  # emit harmless "bad character" warnings while tags still apply
+  if ! cuetag.sh "$source_cue" "$tracks_dir"/track*.flac 2>/dev/null; then
+    echo "[split-cue]   ERROR: cuetag.sh failed for $album_dir" >&2
+    rm -f "$cover_file"
+    return 1
+  fi
+
+  # Re-embed cover. metaflac spec: TYPE|MIME|DESC|WxHxD|FILE
+  if [ -n "$cover_file" ] && [ -s "$cover_file" ]; then
+    local mime
+    mime=$(file -b --mime-type "$cover_file" 2>/dev/null || echo "image/jpeg")
+    local pic_spec="3|${mime}|||${cover_file}"
+    for track in "$tracks_dir"/track*.flac; do
+      [ -f "$track" ] || continue
+      metaflac --import-picture-from="$pic_spec" "$track" 2>/dev/null
+    done
+  fi
+  rm -f "$cover_file"
+
+  # Rename trackNN.flac -> NN. <title>.flac. Suffix to avoid clobber
+  local renamed=0
+  while IFS=$'\t' read -r tn title; do
+    [ -n "$tn" ] || continue
+    local padded
+    padded=$(printf '%02d' "$tn")
+    local trackfile="${tracks_dir}/track${padded}.flac"
+    [ -f "$trackfile" ] || continue
+    local safe
+    safe=$(sanitize_filename "$title")
+    local newname
+    if [ -n "$safe" ]; then
+      newname="${padded}. ${safe}.flac"
+    else
+      newname="${padded}.flac"
+    fi
+    local newfile="${tracks_dir}/${newname}"
+    local suffix=""
+    local n=1
+    while [ -e "${newfile}${suffix}" ]; do
+      suffix=" (${n})"
+      n=$((n + 1))
+    done
+    mv "$trackfile" "${newfile}${suffix}"
+    renamed=$((renamed + 1))
+  done <<<"$(parse_cue_tracks "$source_cue")"
+
+  local count
+  count=$(find "$tracks_dir" -maxdepth 1 -type f -name '*.flac' | wc -l)
+  echo "[split-cue]   -> ${renamed} renamed (${count} total) in $tracks_dir"
+  return 0
+}
+
+if [ "$SPLIT_CUE_FLAG" -eq 1 ]; then
+  if [ -n "$DRY_RUN_FLAG" ]; then
+    echo "[split-cue] dry-run is not supported for splitting; pass will run."
+  fi
+  for tool in cuebreakpoints shnsplit cuetag.sh metaflac file; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "Error: --split-cue requires '$tool'." >&2
+      echo "On Termux:    pkg install shntool cuetools flac file" >&2
+      exit 1
+    fi
+  done
+  echo "Starting --split-cue pass under: $LOCAL_DIR"
+  split_cue_album "$LOCAL_DIR" || true
+  while IFS= read -r -d '' album_dir; do
+    case "$(basename "$album_dir")" in
+    split | tracks | @eaDir) continue ;;
+    esac
+    split_cue_album "$album_dir" || true
+  done < <(find "$LOCAL_DIR" -mindepth 2 -maxdepth 2 -type d -print0)
+  echo "--split-cue pass finished."
+fi
 
 echo "Process finished."
