@@ -1,95 +1,109 @@
 #!/usr/bin/env bash
 
-# Script to sync only existing local subfolders from the remote TLMC repository
-# Handles special characters like [ ] & and spaces in folder names correctly
-#
-# Usage:
-#   ./update.sh [OPTIONS] LOCAL_DIR
-#
-# Arguments:
-#   LOCAL_DIR        The local TLMC base directory (e.g., /media/music/tlmc)
-#
-# Options:
-#   -h, --help       Show this help message and exit
-#   --delete         Delete files inside matched folders that are gone from remote
-#   -n, --dry-run    Trial run: shows what would be synced without transferring files
-#   --split-cue      After sync, split single-flac albums into NN. <title>.flac
-
-# Default values
-DELETE_FLAG=""
-DRY_RUN_FLAG=""
-SPLIT_CUE_FLAG=0
-LOCAL_DIR=""
 URL="rsync://patchouli@rsync.thdisc.com:874/tlmc"
 export RSYNC_PASSWORD=knowledge
 
-show_help() {
-  grep "^#" "$0" | sed 's/^# \{0,1\}//' | head -n 16
-  exit 0
+usage() {
+  cat <<'EOF'
+Usage:
+  tlmc sync [OPTIONS] LOCAL_DIR
+  tlmc split LOCAL_DIR
+
+Commands:
+  sync    Sync directories that already exist locally from the TLMC repository
+  split   Split single-FLAC albums with CUE sheets into individual tracks
+
+Sync options:
+  -g, --granularity LEVEL  Selection level: circle or album (default: circle)
+  --delete                 Delete files in selected directories if absent remotely
+  -n, --dry-run            Show what would be transferred without changing files
+  -h, --help               Show command help
+
+Granularity:
+  circle  Sync every existing top-level circle and all of its contents
+  album   Sync only existing second-level album directories
+EOF
 }
 
-# Parse arguments
-while [[ "$#" -gt 0 ]]; do
-  case $1 in
-  -h | --help) show_help ;;
-  --delete) DELETE_FLAG="--delete" ;;
-  -n | --dry-run) DRY_RUN_FLAG="--dry-run" ;;
-  --split-cue) SPLIT_CUE_FLAG=1 ;;
-  *)
-    if [ -z "$LOCAL_DIR" ]; then
-      LOCAL_DIR="$1"
-    else
-      echo "Unknown argument: $1"
-      exit 1
-    fi
-    ;;
-  esac
-  shift
-done
-
-if [ -z "$LOCAL_DIR" ] || [ ! -d "$LOCAL_DIR" ]; then
-  echo "Error: Valid LOCAL_DIR is required."
+die() {
+  echo "Error: $*" >&2
   exit 1
-fi
+}
 
-# Enter the local directory to scan folders
-# We use full path to avoid any confusion
-LOCAL_DIR=$(realpath "$LOCAL_DIR")
-cd "$LOCAL_DIR" || exit
+require_local_dir() {
+  [ -n "$LOCAL_DIR" ] && [ -d "$LOCAL_DIR" ] || die "valid LOCAL_DIR is required."
+  LOCAL_DIR=$(realpath "$LOCAL_DIR") || exit 1
+}
 
-# Create a temporary filter file
-FILTER_FILE=$(mktemp)
-echo "Generating sync list from: $LOCAL_DIR"
+# Quote rsync filter metacharacters while leaving path separators intact.
+escape_filter_path() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/\[/\\\[/g; s/\]/\\\]/g; s/\*/\\\*/g; s/\?/\\\?/g'
+}
 
-# Step 1: Include the directories themselves (escaped)
-# Step 2: Include everything inside those directories
-# Step 3: Exclude everything else
-for dir in */; do
-  dir="${dir%/}"
-  if [ "$dir" != "*" ]; then
-    # Escape special characters for rsync filter: [ ] * ?
-    # We use a double backslash for the sed replacement to ensure a single backslash ends up in the file
-    safe_dir=$(echo "$dir" | sed 's/\[/\\\[/g; s/\]/\\\]/g; s/\*/\\\*/g; s/\?/\\\?/g')
-    echo "+ /$safe_dir/" >>"$FILTER_FILE"
-    echo "+ /$safe_dir/**" >>"$FILTER_FILE"
+sync_tlmc() {
+  local granularity="circle" delete_flag="" dry_run_flag=""
+  LOCAL_DIR=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -g | --granularity)
+      [ "$#" -ge 2 ] || die "$1 requires circle or album."
+      granularity="$2"
+      shift 2
+      ;;
+    --granularity=*) granularity="${1#*=}"; shift ;;
+    --delete) delete_flag="--delete"; shift ;;
+    -n | --dry-run) dry_run_flag="--dry-run"; shift ;;
+    -h | --help) usage; return 0 ;;
+    -*) die "unknown sync option: $1" ;;
+    *)
+      [ -z "$LOCAL_DIR" ] || die "unexpected argument: $1"
+      LOCAL_DIR="$1"
+      shift
+      ;;
+    esac
+  done
+
+  case "$granularity" in
+  circle | album) ;;
+  *) die "invalid granularity '$granularity' (expected circle or album)." ;;
+  esac
+  require_local_dir
+  command -v rsync-ssl >/dev/null 2>&1 || die "'rsync-ssl' is required."
+
+  local filter_file circle album safe_circle safe_album found=0 status
+  filter_file=$(mktemp) || exit 1
+
+  if [ "$granularity" = "circle" ]; then
+    while IFS= read -r -d '' circle; do
+      safe_circle=$(escape_filter_path "$(basename "$circle")")
+      printf '+ /%s/***\n' "$safe_circle" >>"$filter_file"
+      found=$((found + 1))
+    done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+  else
+    while IFS= read -r -d '' album; do
+      circle=$(basename "$(dirname "$album")")
+      safe_circle=$(escape_filter_path "$circle")
+      safe_album=$(escape_filter_path "$(basename "$album")")
+      printf '+ /%s/\n+ /%s/%s/***\n' "$safe_circle" "$safe_circle" "$safe_album" >>"$filter_file"
+      found=$((found + 1))
+    done < <(find "$LOCAL_DIR" -mindepth 2 -maxdepth 2 -type d \
+      ! -name tracks ! -name split ! -name @eaDir -print0)
   fi
-done
+  printf -- '- /***\n' >>"$filter_file"
 
-# Exclude all other top-level items
-echo "- /*" >>"$FILTER_FILE"
+  echo "Syncing ${found} existing ${granularity}(s) under: $LOCAL_DIR"
+  [ -z "$dry_run_flag" ] || echo "[MODE: DRY RUN]"
+  [ -z "$delete_flag" ] || echo "[MODE: DELETE ENABLED]"
 
-echo "Starting synchronization for existing artists only..."
-if [ -n "$DRY_RUN_FLAG" ]; then echo "[MODE: DRY RUN]"; fi
-if [ -n "$DELETE_FLAG" ]; then echo "[MODE: DELETE ENABLED]"; fi
-
-# Execute rsync-ssl
-# Using -r (recursive) and other -a (archive) flags
-rsync-ssl -avz $DELETE_FLAG $DRY_RUN_FLAG --progress \
-  --filter=". $FILTER_FILE" \
-  "$URL/" "$LOCAL_DIR/"
-
-# Cleanup
-rm "$FILTER_FILE"
+  local -a rsync_args=(-avz --progress --filter=". $filter_file")
+  [ -z "$delete_flag" ] || rsync_args+=("$delete_flag")
+  [ -z "$dry_run_flag" ] || rsync_args+=("$dry_run_flag")
+  rsync-ssl "${rsync_args[@]}" "$URL/" "$LOCAL_DIR/"
+  status=$?
+  rm -f "$filter_file"
+  return "$status"
+}
 
 # Print "<tracknum>\t<title>" lines from a cue sheet
 parse_cue_tracks() {
@@ -256,26 +270,58 @@ split_cue_album() {
   return 0
 }
 
-if [ "$SPLIT_CUE_FLAG" -eq 1 ]; then
-  if [ -n "$DRY_RUN_FLAG" ]; then
-    echo "[split-cue] dry-run is not supported for splitting; pass will run."
-  fi
+split_tlmc() {
+  LOCAL_DIR=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+      echo "Usage: tlmc split LOCAL_DIR"
+      return 0
+      ;;
+    -*) die "unknown split option: $1" ;;
+    *)
+      [ -z "$LOCAL_DIR" ] || die "unexpected argument: $1"
+      LOCAL_DIR="$1"
+      shift
+      ;;
+    esac
+  done
+  require_local_dir
+
   for tool in cuebreakpoints shnsplit cuetag.sh metaflac file; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "Error: --split-cue requires '$tool'." >&2
+      echo "Error: 'tlmc split' requires '$tool'." >&2
       echo "On Termux:    pkg install shntool cuetools flac file" >&2
-      exit 1
+      return 1
     fi
   done
-  echo "Starting --split-cue pass under: $LOCAL_DIR"
-  split_cue_album "$LOCAL_DIR" || true
+
+  local failures=0 album_dir
+  echo "Splitting single-FLAC albums under: $LOCAL_DIR"
+  split_cue_album "$LOCAL_DIR" || failures=$((failures + 1))
   while IFS= read -r -d '' album_dir; do
     case "$(basename "$album_dir")" in
     split | tracks | @eaDir) continue ;;
     esac
-    split_cue_album "$album_dir" || true
+    split_cue_album "$album_dir" || failures=$((failures + 1))
   done < <(find "$LOCAL_DIR" -mindepth 2 -maxdepth 2 -type d -print0)
-  echo "--split-cue pass finished."
-fi
+  echo "Split pass finished."
+  [ "$failures" -eq 0 ] || die "$failures album(s) failed to split."
+}
 
-echo "Process finished."
+case "${1:-}" in
+sync)
+  shift
+  sync_tlmc "$@"
+  ;;
+split)
+  shift
+  split_tlmc "$@"
+  ;;
+-h | --help | help | "") usage ;;
+*)
+  echo "Error: unknown command '$1'." >&2
+  usage >&2
+  exit 1
+  ;;
+esac
