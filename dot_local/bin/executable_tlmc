@@ -8,11 +8,13 @@ usage() {
 Usage:
   tlmc sync [OPTIONS] LOCAL_DIR
   tlmc add LOCAL_DIR
+  tlmc edit LOCAL_DIR
   tlmc split LOCAL_DIR
 
 Commands:
   sync    Sync directories that already exist locally from the TLMC repository
   add     Select new circles/albums with fzf, create them, then sync
+  edit    Select a local circle with fzf and edit its .config
   split   Split single-FLAC albums with CUE sheets into individual tracks
 
 Sync options:
@@ -205,6 +207,17 @@ preview_album() {
   fi
 }
 
+preview_config() {
+  local local_dir="$1" circle="$2" config
+  config="$local_dir/$circle/.config"
+  printf '%s\n\n' "$config"
+  if [ -f "$config" ]; then
+    sed -n '1,200p' "$config"
+  else
+    echo "(missing; granularity=circle will be created)"
+  fi
+}
+
 confirm() {
   local prompt="$1" answer
   read -r -p "$prompt [y/N] " answer
@@ -310,6 +323,61 @@ add_tlmc() {
   }
 
   sync_tlmc "$LOCAL_DIR"
+}
+
+edit_tlmc() {
+  LOCAL_DIR=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+      echo "Usage: tlmc edit LOCAL_DIR"
+      return 0
+      ;;
+    -*) die "unknown edit option: $1" ;;
+    *)
+      [ -z "$LOCAL_DIR" ] || die "unexpected argument: $1"
+      LOCAL_DIR="$1"
+      shift
+      ;;
+    esac
+  done
+  require_local_dir
+  command -v fzf >/dev/null 2>&1 || die "'fzf' is required."
+
+  local circles_file circle circle_dir preview_command editor_command
+  local -a editor_args=()
+  circles_file=$(mktemp) || exit 1
+  while IFS= read -r -d '' circle_dir; do
+    circle=$(basename "$circle_dir")
+    if [ ! -e "$circle_dir/.config" ]; then
+      write_circle_config "$circle_dir" circle || {
+        rm -f "$circles_file"
+        die "failed to create '$circle_dir/.config'."
+      }
+    fi
+    printf '%s\n' "$circle" >>"$circles_file"
+  done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+
+  [ -s "$circles_file" ] || {
+    rm -f "$circles_file"
+    die "no local circles found under '$LOCAL_DIR'."
+  }
+  printf -v preview_command '%q __preview-config %q {}' "$0" "$LOCAL_DIR"
+  circle=$(fzf --prompt='Circle config > ' --height=80% --reverse \
+    --header='Select a circle to edit (Esc to cancel)' \
+    --preview-window='right,60%,wrap' --preview="$preview_command" \
+    <"$circles_file") || circle=""
+  rm -f "$circles_file"
+  [ -n "$circle" ] || {
+    echo "No circle selected."
+    return 0
+  }
+
+  editor_command="${VISUAL:-${EDITOR:-vi}}"
+  read -r -a editor_args <<<"$editor_command"
+  [ "${#editor_args[@]}" -gt 0 ] || die "VISUAL/EDITOR is empty."
+  command -v "${editor_args[0]}" >/dev/null 2>&1 || die "editor '${editor_args[0]}' was not found."
+  "${editor_args[@]}" "$LOCAL_DIR/$circle/.config"
 }
 
 # Print "<tracknum>\t<title>" lines from a cue sheet
@@ -525,6 +593,10 @@ __preview-album)
   shift
   preview_album "$@"
   ;;
+__preview-config)
+  shift
+  preview_config "$@"
+  ;;
 sync)
   shift
   sync_tlmc "$@"
@@ -532,6 +604,10 @@ sync)
 add)
   shift
   add_tlmc "$@"
+  ;;
+edit)
+  shift
+  edit_tlmc "$@"
   ;;
 split)
   shift
