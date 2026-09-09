@@ -7,21 +7,22 @@ usage() {
   cat <<'EOF'
 Usage:
   tlmc sync [OPTIONS] LOCAL_DIR
+  tlmc add LOCAL_DIR
   tlmc split LOCAL_DIR
 
 Commands:
   sync    Sync directories that already exist locally from the TLMC repository
+  add     Select new circles/albums with fzf, create them, then sync
   split   Split single-FLAC albums with CUE sheets into individual tracks
 
 Sync options:
-  -g, --granularity LEVEL  Selection level: circle or album (default: circle)
   --delete                 Delete files in selected directories if absent remotely
   -n, --dry-run            Show what would be transferred without changing files
   -h, --help               Show command help
 
-Granularity:
-  circle  Sync every existing top-level circle and all of its contents
-  album   Sync only existing second-level album directories
+Each circle stores its sync granularity in CIRCLE/.config:
+  granularity=circle       Sync the whole circle (default)
+  granularity=album        Sync only album directories that already exist locally
 EOF
 }
 
@@ -40,18 +41,35 @@ escape_filter_path() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/\[/\\\[/g; s/\]/\\\]/g; s/\*/\\\*/g; s/\?/\\\?/g'
 }
 
+write_circle_config() {
+  local circle_dir="$1" granularity="$2"
+  printf 'granularity=%s\n' "$granularity" >"$circle_dir/.config"
+}
+
+circle_granularity() {
+  local circle_dir="$1" config granularity
+  config="$circle_dir/.config"
+  if [ ! -e "$config" ]; then
+    write_circle_config "$circle_dir" circle || return 1
+  fi
+  [ -f "$config" ] || {
+    echo "Error: '$config' is not a regular file." >&2
+    return 1
+  }
+  granularity=$(sed -n 's/^granularity=\(circle\|album\)$/\1/p' "$config" | tail -n 1)
+  [ -n "$granularity" ] || {
+    echo "Error: invalid '$config' (expected granularity=circle or granularity=album)." >&2
+    return 1
+  }
+  printf '%s' "$granularity"
+}
+
 sync_tlmc() {
-  local granularity="circle" delete_flag="" dry_run_flag=""
+  local delete_flag="" dry_run_flag=""
   LOCAL_DIR=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
-    -g | --granularity)
-      [ "$#" -ge 2 ] || die "$1 requires circle or album."
-      granularity="$2"
-      shift 2
-      ;;
-    --granularity=*) granularity="${1#*=}"; shift ;;
     --delete) delete_flag="--delete"; shift ;;
     -n | --dry-run) dry_run_flag="--dry-run"; shift ;;
     -h | --help) usage; return 0 ;;
@@ -64,35 +82,44 @@ sync_tlmc() {
     esac
   done
 
-  case "$granularity" in
-  circle | album) ;;
-  *) die "invalid granularity '$granularity' (expected circle or album)." ;;
-  esac
   require_local_dir
   command -v rsync-ssl >/dev/null 2>&1 || die "'rsync-ssl' is required."
 
-  local filter_file circle album safe_circle safe_album found=0 status
+  local filter_file circle circle_name album safe_circle safe_album granularity status
+  local circle_count=0 album_circle_count=0 album_count=0
+  local -a circles=()
   filter_file=$(mktemp) || exit 1
 
-  if [ "$granularity" = "circle" ]; then
-    while IFS= read -r -d '' circle; do
-      safe_circle=$(escape_filter_path "$(basename "$circle")")
+  mapfile -d '' circles < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
+  for circle in "${circles[@]}"; do
+    circle_name=$(basename "$circle")
+    safe_circle=$(escape_filter_path "$circle_name")
+    granularity=$(circle_granularity "$circle") || {
+      rm -f "$filter_file"
+      return 1
+    }
+
+    # .config is local state: never fetch it or remove it with --delete.
+    printf 'P /%s/.config\n- /%s/.config\n' "$safe_circle" "$safe_circle" >>"$filter_file"
+    if [ "$granularity" = "circle" ]; then
       printf '+ /%s/***\n' "$safe_circle" >>"$filter_file"
-      found=$((found + 1))
-    done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0)
-  else
-    while IFS= read -r -d '' album; do
-      circle=$(basename "$(dirname "$album")")
-      safe_circle=$(escape_filter_path "$circle")
-      safe_album=$(escape_filter_path "$(basename "$album")")
-      printf '+ /%s/\n+ /%s/%s/***\n' "$safe_circle" "$safe_circle" "$safe_album" >>"$filter_file"
-      found=$((found + 1))
-    done < <(find "$LOCAL_DIR" -mindepth 2 -maxdepth 2 -type d \
-      ! -name tracks ! -name split ! -name @eaDir -print0)
-  fi
+      circle_count=$((circle_count + 1))
+    else
+      printf '+ /%s/\n' "$safe_circle" >>"$filter_file"
+      album_circle_count=$((album_circle_count + 1))
+      while IFS= read -r -d '' album; do
+        safe_album=$(escape_filter_path "$(basename "$album")")
+        printf '+ /%s/%s/***\n' "$safe_circle" "$safe_album" >>"$filter_file"
+        album_count=$((album_count + 1))
+      done < <(find "$circle" -mindepth 1 -maxdepth 1 -type d \
+        ! -name tracks ! -name split ! -name @eaDir -print0)
+    fi
+  done
   printf -- '- /***\n' >>"$filter_file"
 
-  echo "Syncing ${found} existing ${granularity}(s) under: $LOCAL_DIR"
+  echo "Syncing under: $LOCAL_DIR"
+  echo "  circle mode: $circle_count circle(s)"
+  echo "  album mode:  $album_circle_count circle(s), $album_count album(s)"
   [ -z "$dry_run_flag" ] || echo "[MODE: DRY RUN]"
   [ -z "$delete_flag" ] || echo "[MODE: DELETE ENABLED]"
 
@@ -103,6 +130,113 @@ sync_tlmc() {
   status=$?
   rm -f "$filter_file"
   return "$status"
+}
+
+# Print only immediate remote subdirectories, one per line.
+list_remote_dirs() {
+  local remote="$1" list_file status
+  list_file=$(mktemp) || return 1
+  rsync-ssl --list-only "$remote" >"$list_file"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    sed -n \
+      's/^d[^[:space:]]*[[:space:]]\+[^[:space:]]\+[[:space:]]\+[^[:space:]]\+[[:space:]]\+[^[:space:]]\+[[:space:]]\+//p' \
+      "$list_file" | sed '/^\.$/d'
+  fi
+  rm -f "$list_file"
+  return "$status"
+}
+
+confirm() {
+  local prompt="$1" answer
+  read -r -p "$prompt [y/N] " answer
+  case "$answer" in
+  y | Y | yes | YES | Yes) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+add_tlmc() {
+  LOCAL_DIR=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+      echo "Usage: tlmc add LOCAL_DIR"
+      return 0
+      ;;
+    -*) die "unknown add option: $1" ;;
+    *)
+      [ -z "$LOCAL_DIR" ] || die "unexpected argument: $1"
+      LOCAL_DIR="$1"
+      shift
+      ;;
+    esac
+  done
+  require_local_dir
+  command -v rsync-ssl >/dev/null 2>&1 || die "'rsync-ssl' is required."
+  command -v fzf >/dev/null 2>&1 || die "'fzf' is required."
+
+  local circles_file albums_file circle album circle_was_present
+  local added=0
+  circles_file=$(mktemp) || exit 1
+  echo "Loading remote circles..."
+  if ! list_remote_dirs "$URL/" >"$circles_file"; then
+    rm -f "$circles_file"
+    die "failed to list remote circles."
+  fi
+  [ -s "$circles_file" ] || {
+    rm -f "$circles_file"
+    die "the remote circle list is empty."
+  }
+
+  while :; do
+    circle=$(fzf --prompt='Circle > ' --height=80% --reverse \
+      --header='Select a circle (Esc to finish)' <"$circles_file") || circle=""
+    [ -n "$circle" ] || break
+    circle_was_present=0
+    [ ! -d "$LOCAL_DIR/$circle" ] || circle_was_present=1
+    mkdir -p -- "$LOCAL_DIR/$circle"
+
+    if confirm "Select an album under '$circle'?"; then
+      albums_file=$(mktemp) || {
+        rm -f "$circles_file"
+        exit 1
+      }
+      echo "Loading albums for: $circle"
+      if ! list_remote_dirs "$URL/$circle/" >"$albums_file"; then
+        rm -f "$albums_file" "$circles_file"
+        die "failed to list albums under '$circle'."
+      fi
+      album=$(fzf --prompt='Album > ' --height=80% --reverse \
+        --header="Select an album from $circle (Esc to cancel)" <"$albums_file") || album=""
+      rm -f "$albums_file"
+      if [ -n "$album" ]; then
+        mkdir -p -- "$LOCAL_DIR/$circle/$album"
+        write_circle_config "$LOCAL_DIR/$circle" album
+        echo "Added album: $circle/$album"
+        added=$((added + 1))
+      else
+        echo "No album selected."
+        if [ "$circle_was_present" -eq 0 ]; then
+          rmdir -- "$LOCAL_DIR/$circle" 2>/dev/null || true
+        fi
+      fi
+    else
+      write_circle_config "$LOCAL_DIR/$circle" circle
+      echo "Added circle: $circle"
+      added=$((added + 1))
+    fi
+
+    confirm "Continue adding?" || break
+  done
+  rm -f "$circles_file"
+
+  [ "$added" -gt 0 ] || {
+    echo "Nothing added; synchronization skipped."
+    return 0
+  }
+
+  sync_tlmc "$LOCAL_DIR"
 }
 
 # Print "<tracknum>\t<title>" lines from a cue sheet
@@ -313,6 +447,10 @@ case "${1:-}" in
 sync)
   shift
   sync_tlmc "$@"
+  ;;
+add)
+  shift
+  add_tlmc "$@"
   ;;
 split)
   shift
