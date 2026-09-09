@@ -290,7 +290,7 @@ add_tlmc() {
 
   local circles_file albums_file preview_cache circle_preview album_preview
   local circle album circle_was_present
-  local added=0 album_mode=0 circle_album_added=0
+  local added=0 circle_album_added=0
   circles_file=$(mktemp) || exit 1
   preview_cache=$(mktemp -d) || {
     rm -f "$circles_file"
@@ -320,7 +320,6 @@ add_tlmc() {
     circle_album_added=0
 
     if confirm "Select an album under '$circle'?"; then
-      album_mode=1
       albums_file=$(mktemp) || {
         rm -f "$circles_file"
         exit 1
@@ -358,8 +357,7 @@ add_tlmc() {
       added=$((added + 1))
     fi
 
-    [ "$album_mode" -eq 0 ] || break
-    confirm "Continue adding circles?" || break
+    confirm "Continue adding other circles?" || break
   done
   rm -f "$circles_file"
   rm -rf -- "$preview_cache"
@@ -449,9 +447,7 @@ delete_tlmc() {
 
   local circles_file albums_file circle album circle_dir album_dir
   local circle_preview album_preview
-  local album_mode=0
   while :; do
-    album_mode=0
     circles_file=$(mktemp) || exit 1
     find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
       | sort >"$circles_file"
@@ -476,7 +472,6 @@ delete_tlmc() {
       rm -rf -- "$circle_dir"
       echo "Deleted circle: $circle"
     else
-      album_mode=1
       printf -v album_preview '%q __preview-local-album %q %q {}' \
         "$0" "$LOCAL_DIR" "$circle"
       while :; do
@@ -508,8 +503,7 @@ delete_tlmc() {
       done
     fi
 
-    [ "$album_mode" -eq 0 ] || break
-    confirm "Continue deleting circles?" || break
+    confirm "Continue deleting other circles?" || break
   done
 }
 
