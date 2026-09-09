@@ -147,6 +147,64 @@ list_remote_dirs() {
   return "$status"
 }
 
+preview_cache_file() {
+  local cache_dir="$1" key="$2" checksum
+  checksum=$(printf '%s' "$key" | cksum)
+  checksum="${checksum%% *}"
+  printf '%s/%s' "$cache_dir" "$checksum"
+}
+
+preview_circle() {
+  local cache_dir="$1" circle="$2" cache_file temp_file
+  cache_file=$(preview_cache_file "$cache_dir" "circle/$circle")
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  temp_file="${cache_file}.$$"
+  echo "Loading albums for: $circle"
+  if list_remote_dirs "$URL/$circle/" >"$temp_file"; then
+    mv -f "$temp_file" "$cache_file"
+    if [ -s "$cache_file" ]; then
+      cat "$cache_file"
+    else
+      echo "(no album directories)"
+    fi
+  else
+    rm -f "$temp_file"
+    echo "Failed to load preview." >&2
+    return 1
+  fi
+}
+
+preview_album() {
+  local cache_dir="$1" circle="$2" album="$3" cache_file temp_file status
+  cache_file=$(preview_cache_file "$cache_dir" "album/$circle/$album")
+  if [ -f "$cache_file" ]; then
+    cat "$cache_file"
+    return 0
+  fi
+
+  temp_file="${cache_file}.$$"
+  echo "Loading contents for: $album"
+  rsync-ssl --list-only "$URL/$circle/$album/" >"$temp_file"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    sed -i '/[[:space:]]\.$/d' "$temp_file"
+    mv -f "$temp_file" "$cache_file"
+    if [ -s "$cache_file" ]; then
+      cat "$cache_file"
+    else
+      echo "(empty album)"
+    fi
+  else
+    rm -f "$temp_file"
+    echo "Failed to load preview." >&2
+    return "$status"
+  fi
+}
+
 confirm() {
   local prompt="$1" answer
   read -r -p "$prompt [y/N] " answer
@@ -176,9 +234,15 @@ add_tlmc() {
   command -v rsync-ssl >/dev/null 2>&1 || die "'rsync-ssl' is required."
   command -v fzf >/dev/null 2>&1 || die "'fzf' is required."
 
-  local circles_file albums_file circle album circle_was_present
+  local circles_file albums_file preview_cache circle_preview album_preview
+  local circle album circle_was_present
   local added=0
   circles_file=$(mktemp) || exit 1
+  preview_cache=$(mktemp -d) || {
+    rm -f "$circles_file"
+    exit 1
+  }
+  trap 'rm -rf -- "$preview_cache"' EXIT
   echo "Loading remote circles..."
   if ! list_remote_dirs "$URL/" >"$circles_file"; then
     rm -f "$circles_file"
@@ -188,10 +252,13 @@ add_tlmc() {
     rm -f "$circles_file"
     die "the remote circle list is empty."
   }
+  printf -v circle_preview '%q __preview-circle %q {}' "$0" "$preview_cache"
 
   while :; do
     circle=$(fzf --prompt='Circle > ' --height=80% --reverse \
-      --header='Select a circle (Esc to finish)' <"$circles_file") || circle=""
+      --header='Select a circle (Esc to finish)' \
+      --preview-window='right,60%,wrap' --preview="$circle_preview" \
+      <"$circles_file") || circle=""
     [ -n "$circle" ] || break
     circle_was_present=0
     [ ! -d "$LOCAL_DIR/$circle" ] || circle_was_present=1
@@ -207,8 +274,12 @@ add_tlmc() {
         rm -f "$albums_file" "$circles_file"
         die "failed to list albums under '$circle'."
       fi
+      printf -v album_preview '%q __preview-album %q %q {}' \
+        "$0" "$preview_cache" "$circle"
       album=$(fzf --prompt='Album > ' --height=80% --reverse \
-        --header="Select an album from $circle (Esc to cancel)" <"$albums_file") || album=""
+        --header="Select an album from $circle (Esc to cancel)" \
+        --preview-window='right,60%,wrap' --preview="$album_preview" \
+        <"$albums_file") || album=""
       rm -f "$albums_file"
       if [ -n "$album" ]; then
         mkdir -p -- "$LOCAL_DIR/$circle/$album"
@@ -230,6 +301,8 @@ add_tlmc() {
     confirm "Continue adding?" || break
   done
   rm -f "$circles_file"
+  rm -rf -- "$preview_cache"
+  trap - EXIT
 
   [ "$added" -gt 0 ] || {
     echo "Nothing added; synchronization skipped."
@@ -444,6 +517,14 @@ split_tlmc() {
 }
 
 case "${1:-}" in
+__preview-circle)
+  shift
+  preview_circle "$@"
+  ;;
+__preview-album)
+  shift
+  preview_album "$@"
+  ;;
 sync)
   shift
   sync_tlmc "$@"
