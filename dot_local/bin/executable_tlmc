@@ -251,10 +251,18 @@ filter_missing_dirs() {
 }
 
 filter_available_circles() {
-  local source_file="$1" local_dir="$2" circle
+  local source_file="$1" local_dir="$2" circle config
   while IFS= read -r circle; do
     [ -n "$circle" ] || continue
-    [ -d "$local_dir/$circle" ] || printf '%s\n' "$circle"
+    if [ ! -d "$local_dir/$circle" ]; then
+      printf '%s\n' "$circle"
+      continue
+    fi
+
+    config="$local_dir/$circle/.config"
+    if [ -f "$config" ] && grep -qx 'granularity=album' "$config"; then
+      printf '%s\n' "$circle"
+    fi
   done <"$source_file"
 }
 
@@ -357,7 +365,7 @@ add_tlmc() {
     filter_available_circles "$remote_circles_file" "$LOCAL_DIR" >"$circles_file"
     if [ ! -s "$circles_file" ]; then
       rm -f "$circles_file"
-      echo "No new circles are available."
+      echo "No new circles or album-mode circles are available."
       break
     fi
     circle=$(fzf --prompt='Circle > ' --height=80% --reverse \
