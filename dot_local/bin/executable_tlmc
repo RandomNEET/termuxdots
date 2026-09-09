@@ -7,19 +7,19 @@ export RSYNC_PASSWORD=knowledge
 usage() {
   cat <<'EOF'
 Usage:
+  tlmc news
   tlmc sync [OPTIONS] LOCAL_DIR
   tlmc add LOCAL_DIR
   tlmc edit LOCAL_DIR
   tlmc delete LOCAL_DIR
-  tlmc news
   tlmc split LOCAL_DIR
 
 Commands:
+  news    Show the TLMC synchronization log
   sync    Sync directories that already exist locally from the TLMC repository
   add     Select new circles/albums with fzf, create them, then sync
   edit    Select a local circle with fzf and edit its .config
   delete  Select and delete local circles/albums with fzf
-  news    Show the TLMC synchronization log
   split   Split single-FLAC albums with CUE sheets into individual tracks
 
 Sync options:
@@ -42,6 +42,85 @@ require_local_dir() {
   [ -n "$LOCAL_DIR" ] && [ -d "$LOCAL_DIR" ] || die "valid LOCAL_DIR is required."
   LOCAL_DIR=$(realpath "$LOCAL_DIR") || exit 1
 }
+
+confirm() {
+  local prompt="$1" answer
+  read -r -p "$prompt [y/N] " answer
+  case "$answer" in
+  y | Y | yes | YES | Yes) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+confirm_default_yes() {
+  local prompt="$1" answer
+  read -r -p "$prompt [Y/n] " answer
+  case "$answer" in
+  n | N | no | NO | No) return 1 ;;
+  *) return 0 ;;
+  esac
+}
+
+valid_child_name() {
+  case "$1" in
+  "" | . | .. | */*) return 1 ;;
+  *) return 0 ;;
+  esac
+}
+
+# News
+
+news_tlmc() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+      echo "Usage: tlmc news"
+      return 0
+      ;;
+    *) die "unexpected news argument: $1" ;;
+    esac
+  done
+  command -v curl >/dev/null 2>&1 || die "'curl' is required."
+
+  local news_file status pager_command
+  local -a pager_args=()
+  news_file=$(mktemp) || exit 1
+  trap 'rm -f -- "$news_file"' EXIT
+
+  curl -fsSL --connect-timeout 15 --max-time 120 \
+    --user "patchouli:$RSYNC_PASSWORD" "$NEWS_URL" >"$news_file"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$news_file"
+    trap - EXIT
+    echo "Error: failed to fetch TLMC news from $NEWS_URL" >&2
+    return "$status"
+  fi
+
+  if [ ! -t 1 ]; then
+    cat "$news_file"
+    status=$?
+  elif command -v glow >/dev/null 2>&1; then
+    glow -p "$news_file"
+    status=$?
+  else
+    pager_command="${PAGER:-less -R}"
+    read -r -a pager_args <<<"$pager_command"
+    if [ "${#pager_args[@]}" -gt 0 ] && command -v "${pager_args[0]}" >/dev/null 2>&1; then
+      "${pager_args[@]}" "$news_file"
+      status=$?
+    else
+      cat "$news_file"
+      status=$?
+    fi
+  fi
+
+  rm -f "$news_file"
+  trap - EXIT
+  return "$status"
+}
+
+# Sync
 
 # Quote rsync filter metacharacters while leaving path separators intact.
 escape_filter_path() {
@@ -139,6 +218,8 @@ sync_tlmc() {
   return "$status"
 }
 
+# Add
+
 # Print only immediate remote subdirectories, one per line.
 list_remote_dirs() {
   local remote="$1" list_file status
@@ -210,65 +291,6 @@ preview_album() {
     echo "Failed to load preview." >&2
     return "$status"
   fi
-}
-
-preview_config() {
-  local local_dir="$1" circle="$2" config
-  config="$local_dir/$circle/.config"
-  printf '%s\n\n' "$config"
-  if [ -f "$config" ]; then
-    sed -n '1,200p' "$config"
-  else
-    echo "(missing; granularity=circle will be created)"
-  fi
-}
-
-preview_local_albums() {
-  local local_dir="$1" circle="$2" circle_dir
-  circle_dir="$local_dir/$circle"
-  [ -d "$circle_dir" ] || {
-    echo "(circle no longer exists)"
-    return 0
-  }
-  printf '%s\n\n' "$circle_dir"
-  find "$circle_dir" -mindepth 1 -maxdepth 1 -type d \
-    ! -name tracks ! -name split ! -name @eaDir -printf '%f\n' | sort
-}
-
-preview_local_album_contents() {
-  local local_dir="$1" circle="$2" album="$3" album_dir
-  album_dir="$local_dir/$circle/$album"
-  [ -d "$album_dir" ] || {
-    echo "(album no longer exists)"
-    return 0
-  }
-  printf '%s\n\n' "$album_dir"
-  ls -lahA -- "$album_dir"
-}
-
-confirm() {
-  local prompt="$1" answer
-  read -r -p "$prompt [y/N] " answer
-  case "$answer" in
-  y | Y | yes | YES | Yes) return 0 ;;
-  *) return 1 ;;
-  esac
-}
-
-confirm_default_yes() {
-  local prompt="$1" answer
-  read -r -p "$prompt [Y/n] " answer
-  case "$answer" in
-  n | N | no | NO | No) return 1 ;;
-  *) return 0 ;;
-  esac
-}
-
-valid_child_name() {
-  case "$1" in
-  "" | . | .. | */*) return 1 ;;
-  *) return 0 ;;
-  esac
 }
 
 add_tlmc() {
@@ -374,6 +396,19 @@ add_tlmc() {
   sync_tlmc "$LOCAL_DIR"
 }
 
+# Edit
+
+preview_config() {
+  local local_dir="$1" circle="$2" config
+  config="$local_dir/$circle/.config"
+  printf '%s\n\n' "$config"
+  if [ -f "$config" ]; then
+    sed -n '1,200p' "$config"
+  else
+    echo "(missing; granularity=circle will be created)"
+  fi
+}
+
 edit_tlmc() {
   LOCAL_DIR=""
   while [ "$#" -gt 0 ]; do
@@ -422,11 +457,36 @@ edit_tlmc() {
     return 0
   }
 
-  editor_command="${VISUAL:-${EDITOR:-vi}}"
+  editor_command="${VISUAL:-${EDITOR:-nano}}"
   read -r -a editor_args <<<"$editor_command"
   [ "${#editor_args[@]}" -gt 0 ] || die "VISUAL/EDITOR is empty."
   command -v "${editor_args[0]}" >/dev/null 2>&1 || die "editor '${editor_args[0]}' was not found."
   "${editor_args[@]}" "$LOCAL_DIR/$circle/.config"
+}
+
+# Delete
+
+preview_local_albums() {
+  local local_dir="$1" circle="$2" circle_dir
+  circle_dir="$local_dir/$circle"
+  [ -d "$circle_dir" ] || {
+    echo "(circle no longer exists)"
+    return 0
+  }
+  printf '%s\n\n' "$circle_dir"
+  find "$circle_dir" -mindepth 1 -maxdepth 1 -type d \
+    ! -name tracks ! -name split ! -name @eaDir -printf '%f\n' | sort
+}
+
+preview_local_album_contents() {
+  local local_dir="$1" circle="$2" album="$3" album_dir
+  album_dir="$local_dir/$circle/$album"
+  [ -d "$album_dir" ] || {
+    echo "(album no longer exists)"
+    return 0
+  }
+  printf '%s\n\n' "$album_dir"
+  ls -lahA -- "$album_dir"
 }
 
 delete_tlmc() {
@@ -510,53 +570,7 @@ delete_tlmc() {
   done
 }
 
-news_tlmc() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-    -h | --help)
-      echo "Usage: tlmc news"
-      return 0
-      ;;
-    *) die "unexpected news argument: $1" ;;
-    esac
-  done
-  command -v curl >/dev/null 2>&1 || die "'curl' is required."
-
-  local news_file status pager_command
-  local -a pager_args=()
-  news_file=$(mktemp) || exit 1
-  trap 'rm -f -- "$news_file"' EXIT
-  curl -fsSL --connect-timeout 15 --max-time 120 \
-    --user "patchouli:$RSYNC_PASSWORD" "$NEWS_URL" >"$news_file"
-  status=$?
-  if [ "$status" -ne 0 ]; then
-    rm -f "$news_file"
-    trap - EXIT
-    echo "Error: failed to fetch TLMC news from $NEWS_URL" >&2
-    return "$status"
-  fi
-
-  if [ ! -t 1 ]; then
-    cat "$news_file"
-    status=$?
-  elif command -v glow >/dev/null 2>&1; then
-    glow -p "$news_file"
-    status=$?
-  else
-    pager_command="${PAGER:-less -R}"
-    read -r -a pager_args <<<"$pager_command"
-    if [ "${#pager_args[@]}" -gt 0 ] && command -v "${pager_args[0]}" >/dev/null 2>&1; then
-      "${pager_args[@]}" "$news_file"
-      status=$?
-    else
-      cat "$news_file"
-      status=$?
-    fi
-  fi
-  rm -f "$news_file"
-  trap - EXIT
-  return "$status"
-}
+# Split
 
 # Print "<tracknum>\t<title>" lines from a cue sheet
 parse_cue_tracks() {
@@ -783,6 +797,10 @@ __preview-local-album)
   shift
   preview_local_album_contents "$@"
   ;;
+news)
+  shift
+  news_tlmc "$@"
+  ;;
 sync)
   shift
   sync_tlmc "$@"
@@ -798,10 +816,6 @@ edit)
 delete)
   shift
   delete_tlmc "$@"
-  ;;
-news)
-  shift
-  news_tlmc "$@"
   ;;
 split)
   shift
