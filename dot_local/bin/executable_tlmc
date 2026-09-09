@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 URL="rsync://patchouli@rsync.thdisc.com:874/tlmc"
+NEWS_URL="https://down.thdisc.com/sync_logfull.md"
 export RSYNC_PASSWORD=knowledge
 
 usage() {
@@ -10,6 +11,7 @@ Usage:
   tlmc add LOCAL_DIR
   tlmc edit LOCAL_DIR
   tlmc delete LOCAL_DIR
+  tlmc news
   tlmc split LOCAL_DIR
 
 Commands:
@@ -17,6 +19,7 @@ Commands:
   add     Select new circles/albums with fzf, create them, then sync
   edit    Select a local circle with fzf and edit its .config
   delete  Select and delete local circles/albums with fzf
+  news    Show the TLMC synchronization log
   split   Split single-FLAC albums with CUE sheets into individual tracks
 
 Sync options:
@@ -507,6 +510,54 @@ delete_tlmc() {
   done
 }
 
+news_tlmc() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+      echo "Usage: tlmc news"
+      return 0
+      ;;
+    *) die "unexpected news argument: $1" ;;
+    esac
+  done
+  command -v curl >/dev/null 2>&1 || die "'curl' is required."
+
+  local news_file status pager_command
+  local -a pager_args=()
+  news_file=$(mktemp) || exit 1
+  trap 'rm -f -- "$news_file"' EXIT
+  curl -fsSL --connect-timeout 15 --max-time 120 \
+    --user "patchouli:$RSYNC_PASSWORD" "$NEWS_URL" >"$news_file"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$news_file"
+    trap - EXIT
+    echo "Error: failed to fetch TLMC news from $NEWS_URL" >&2
+    return "$status"
+  fi
+
+  if [ ! -t 1 ]; then
+    cat "$news_file"
+    status=$?
+  elif command -v glow >/dev/null 2>&1; then
+    glow -p "$news_file"
+    status=$?
+  else
+    pager_command="${PAGER:-less -R}"
+    read -r -a pager_args <<<"$pager_command"
+    if [ "${#pager_args[@]}" -gt 0 ] && command -v "${pager_args[0]}" >/dev/null 2>&1; then
+      "${pager_args[@]}" "$news_file"
+      status=$?
+    else
+      cat "$news_file"
+      status=$?
+    fi
+  fi
+  rm -f "$news_file"
+  trap - EXIT
+  return "$status"
+}
+
 # Print "<tracknum>\t<title>" lines from a cue sheet
 parse_cue_tracks() {
   awk '
@@ -747,6 +798,10 @@ edit)
 delete)
   shift
   delete_tlmc "$@"
+  ;;
+news)
+  shift
+  news_tlmc "$@"
   ;;
 split)
   shift
