@@ -84,7 +84,7 @@ news_tlmc() {
 
   local news_file status pager_command
   local -a pager_args=()
-  news_file=$(mktemp) || exit 1
+  news_file=$(mktemp --suffix=.md) || exit 1
   trap 'rm -f -- "$news_file"' EXIT
 
   curl -fsSL --connect-timeout 15 --max-time 120 \
@@ -156,9 +156,18 @@ sync_tlmc() {
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
-    --delete) delete_flag="--delete"; shift ;;
-    -n | --dry-run) dry_run_flag="--dry-run"; shift ;;
-    -h | --help) usage; return 0 ;;
+    --delete)
+      delete_flag="--delete"
+      shift
+      ;;
+    -n | --dry-run)
+      dry_run_flag="--dry-run"
+      shift
+      ;;
+    -h | --help)
+      usage
+      return 0
+      ;;
     -*) die "unknown sync option: $1" ;;
     *)
       [ -z "$LOCAL_DIR" ] || die "unexpected argument: $1"
@@ -555,8 +564,8 @@ delete_tlmc() {
   local circle_preview album_preview
   while :; do
     circles_file=$(mktemp) || exit 1
-    find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-      | sort >"$circles_file"
+    find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
+      sort >"$circles_file"
     if [ ! -s "$circles_file" ]; then
       rm -f "$circles_file"
       echo "No local circles remain under: $LOCAL_DIR"
@@ -583,8 +592,8 @@ delete_tlmc() {
       while :; do
         albums_file=$(mktemp) || exit 1
         find "$circle_dir" -mindepth 1 -maxdepth 1 -type d \
-          ! -name tracks ! -name split ! -name @eaDir -printf '%f\n' \
-          | sort >"$albums_file"
+          ! -name tracks ! -name split ! -name @eaDir -printf '%f\n' |
+          sort >"$albums_file"
         if [ ! -s "$albums_file" ]; then
           rm -f "$albums_file"
           echo "No album directories remain under: $circle"
