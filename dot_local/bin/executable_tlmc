@@ -290,7 +290,7 @@ add_tlmc() {
 
   local circles_file albums_file preview_cache circle_preview album_preview
   local circle album circle_was_present
-  local added=0
+  local added=0 album_mode=0 circle_album_added=0
   circles_file=$(mktemp) || exit 1
   preview_cache=$(mktemp -d) || {
     rm -f "$circles_file"
@@ -317,8 +317,10 @@ add_tlmc() {
     circle_was_present=0
     [ ! -d "$LOCAL_DIR/$circle" ] || circle_was_present=1
     mkdir -p -- "$LOCAL_DIR/$circle"
+    circle_album_added=0
 
     if confirm "Select an album under '$circle'?"; then
+      album_mode=1
       albums_file=$(mktemp) || {
         rm -f "$circles_file"
         exit 1
@@ -330,29 +332,34 @@ add_tlmc() {
       fi
       printf -v album_preview '%q __preview-album %q %q {}' \
         "$0" "$preview_cache" "$circle"
-      album=$(fzf --prompt='Album > ' --height=80% --reverse \
-        --header="Select an album from $circle (Esc to cancel)" \
-        --preview-window='right,60%,wrap' --preview="$album_preview" \
-        <"$albums_file") || album=""
-      rm -f "$albums_file"
-      if [ -n "$album" ]; then
-        mkdir -p -- "$LOCAL_DIR/$circle/$album"
-        write_circle_config "$LOCAL_DIR/$circle" album
-        echo "Added album: $circle/$album"
-        added=$((added + 1))
-      else
-        echo "No album selected."
-        if [ "$circle_was_present" -eq 0 ]; then
-          rmdir -- "$LOCAL_DIR/$circle" 2>/dev/null || true
+      while :; do
+        album=$(fzf --prompt='Album > ' --height=80% --reverse \
+          --header="Select an album from $circle (Esc to cancel)" \
+          --preview-window='right,60%,wrap' --preview="$album_preview" \
+          <"$albums_file") || album=""
+        if [ -n "$album" ]; then
+          mkdir -p -- "$LOCAL_DIR/$circle/$album"
+          write_circle_config "$LOCAL_DIR/$circle" album
+          echo "Added album: $circle/$album"
+          added=$((added + 1))
+          circle_album_added=$((circle_album_added + 1))
+        else
+          echo "No album selected."
+          if [ "$circle_was_present" -eq 0 ] && [ "$circle_album_added" -eq 0 ]; then
+            rmdir -- "$LOCAL_DIR/$circle" 2>/dev/null || true
+          fi
         fi
-      fi
+        confirm "Continue adding albums under '$circle'?" || break
+      done
+      rm -f "$albums_file"
     else
       write_circle_config "$LOCAL_DIR/$circle" circle
       echo "Added circle: $circle"
       added=$((added + 1))
     fi
 
-    confirm "Continue adding?" || break
+    [ "$album_mode" -eq 0 ] || break
+    confirm "Continue adding circles?" || break
   done
   rm -f "$circles_file"
   rm -rf -- "$preview_cache"
@@ -442,7 +449,9 @@ delete_tlmc() {
 
   local circles_file albums_file circle album circle_dir album_dir
   local circle_preview album_preview
+  local album_mode=0
   while :; do
+    album_mode=0
     circles_file=$(mktemp) || exit 1
     find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
       | sort >"$circles_file"
@@ -467,16 +476,20 @@ delete_tlmc() {
       rm -rf -- "$circle_dir"
       echo "Deleted circle: $circle"
     else
-      albums_file=$(mktemp) || exit 1
-      find "$circle_dir" -mindepth 1 -maxdepth 1 -type d \
-        ! -name tracks ! -name split ! -name @eaDir -printf '%f\n' \
-        | sort >"$albums_file"
-      if [ ! -s "$albums_file" ]; then
-        rm -f "$albums_file"
-        echo "No album directories found under: $circle"
-      else
-        printf -v album_preview '%q __preview-local-album %q %q {}' \
-          "$0" "$LOCAL_DIR" "$circle"
+      album_mode=1
+      printf -v album_preview '%q __preview-local-album %q %q {}' \
+        "$0" "$LOCAL_DIR" "$circle"
+      while :; do
+        albums_file=$(mktemp) || exit 1
+        find "$circle_dir" -mindepth 1 -maxdepth 1 -type d \
+          ! -name tracks ! -name split ! -name @eaDir -printf '%f\n' \
+          | sort >"$albums_file"
+        if [ ! -s "$albums_file" ]; then
+          rm -f "$albums_file"
+          echo "No album directories remain under: $circle"
+          break
+        fi
+
         album=$(fzf --prompt='Delete album > ' --height=80% --reverse \
           --header="Select an album from $circle (Esc to cancel)" \
           --preview-window='right,60%,wrap' --preview="$album_preview" \
@@ -491,10 +504,12 @@ delete_tlmc() {
         else
           echo "No album selected."
         fi
-      fi
+        confirm "Continue deleting albums under '$circle'?" || break
+      done
     fi
 
-    confirm "Continue deleting?" || break
+    [ "$album_mode" -eq 0 ] || break
+    confirm "Continue deleting circles?" || break
   done
 }
 
