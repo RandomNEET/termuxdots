@@ -664,16 +664,26 @@ sanitize_filename() {
 
 find_cue_flac() {
   local source_cue="$1" allow_single_fallback="$2"
-  local cue_dir cue_name cue_stem candidate candidate_name
+  local cue_dir cue_name cue_stem cue_reference cue_reference_stem candidate candidate_name
   local -a flacs=()
   cue_dir=$(dirname "$source_cue")
   cue_name=$(basename "$source_cue")
   cue_stem="${cue_name%.*}"
+  cue_reference=$(sed -n 's/^[[:space:]]*FILE[[:space:]]*"\([^"]*\)".*/\1/p' "$source_cue" | head -n 1)
+  if [ -z "$cue_reference" ]; then
+    cue_reference=$(sed -n \
+      's/^[[:space:]]*FILE[[:space:]]\+\(.*\)[[:space:]]\+\(WAVE\|MP3\|BINARY\)[[:space:]]*$/\1/p' \
+      "$source_cue" | head -n 1)
+  fi
+  cue_reference="${cue_reference%$'\r'}"
+  cue_reference_stem="${cue_reference%.*}"
 
   while IFS= read -r -d '' candidate; do
     flacs+=("$candidate")
     candidate_name=$(basename "$candidate")
-    if [ "${candidate_name%.*}" = "$cue_stem" ]; then
+    if [ "${candidate_name%.*}" = "$cue_stem" ] || \
+      [ "$candidate_name" = "$cue_reference" ] || \
+      [ "${candidate_name%.*}" = "$cue_reference_stem" ]; then
       printf '%s' "$candidate"
       return 0
     fi
@@ -685,6 +695,14 @@ find_cue_flac() {
     return 0
   fi
   return 1
+}
+
+is_auxiliary_cue_path() {
+  local lower_path="${1,,}"
+  case "$lower_path" in
+  *special* | *postcard* | *contents* | *instrument* | *lyrics* | *scans* | *booklet*) return 0 ;;
+  *) return 1 ;;
+  esac
 }
 
 split_cue_image() {
@@ -824,7 +842,7 @@ split_tlmc() {
   done
 
   local failures=0 album_dir cue_file source_flac tracks_dir
-  local cue_count cue_name cue_stem safe_stem
+  local cue_count cue_file_count flac_count cue_name cue_stem safe_stem
   echo "Splitting single-FLAC albums under: $LOCAL_DIR"
   while IFS= read -r -d '' cue_file; do
     album_dir=$(dirname "$cue_file")
@@ -832,10 +850,26 @@ split_tlmc() {
     split | tracks | @eaDir) continue ;;
     esac
 
+    if is_auxiliary_cue_path "$album_dir"; then
+      echo "[split-cue] skip (auxiliary content): $cue_file"
+      continue
+    fi
+
+    cue_file_count=$(grep -cE '^[[:space:]]*FILE[[:space:]]+' "$cue_file")
+    if [ "$cue_file_count" -ne 1 ]; then
+      echo "[split-cue] skip (not a single-image CUE): $cue_file"
+      continue
+    fi
+
     cue_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.cue' | wc -l)
     if ! source_flac=$(find_cue_flac "$cue_file" "$((cue_count == 1))"); then
-      echo "[split-cue] ERROR: no unambiguous FLAC match for $cue_file" >&2
-      failures=$((failures + 1))
+      flac_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.flac' | wc -l)
+      if [ "$flac_count" -gt 1 ]; then
+        echo "[split-cue] skip (no matching image FLAC): $cue_file"
+      else
+        echo "[split-cue] ERROR: no FLAC match for $cue_file" >&2
+        failures=$((failures + 1))
+      fi
       continue
     fi
 
