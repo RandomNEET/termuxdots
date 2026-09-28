@@ -683,11 +683,11 @@ split_cue_album() {
 
   local source_flac="${flacs[0]}"
   local source_cue="${cues[0]}"
-  local flac_name
-  flac_name=$(basename "$source_flac")
 
-  # Cue must reference the flac by name
-  if ! grep -qiE "^[[:space:]]*FILE[[:space:]]+\"?[^\"]*${flac_name//./\\.}\"?" "$source_cue"; then
+  # A single CUE and FLAC in the same directory are an unambiguous pair.
+  # Do not compare their names: older CUE sheets may use a legacy encoding
+  # while filesystem names are UTF-8.
+  if ! grep -qiE '^[[:space:]]*FILE[[:space:]]+' "$source_cue"; then
     return 0
   fi
 
@@ -815,15 +815,20 @@ split_tlmc() {
     fi
   done
 
-  local failures=0 album_dir
+  local failures=0 album_dir cue_file
+  local -A visited=()
   echo "Splitting single-FLAC albums under: $LOCAL_DIR"
-  split_cue_album "$LOCAL_DIR" || failures=$((failures + 1))
-  while IFS= read -r -d '' album_dir; do
+  while IFS= read -r -d '' cue_file; do
+    album_dir=$(dirname "$cue_file")
+    [ -z "${visited["$album_dir"]+set}" ] || continue
+    visited["$album_dir"]=1
     case "$(basename "$album_dir")" in
     split | tracks | @eaDir) continue ;;
     esac
     split_cue_album "$album_dir" || failures=$((failures + 1))
-  done < <(find "$LOCAL_DIR" -mindepth 2 -maxdepth 2 -type d -print0)
+  done < <(find "$LOCAL_DIR" \
+    -type d \( -name tracks -o -name split -o -name @eaDir \) -prune -o \
+    -type f -iname '*.cue' -print0)
   echo "Split pass finished."
   [ "$failures" -eq 0 ] || die "$failures album(s) failed to split."
 }
