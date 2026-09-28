@@ -8,24 +8,33 @@ usage() {
   cat <<'EOF'
 Usage:
   tlmc news
-  tlmc sync [OPTIONS] LOCAL_DIR
+  tlmc sync [delete] LOCAL_DIR
   tlmc add LOCAL_DIR
   tlmc edit LOCAL_DIR
   tlmc delete LOCAL_DIR
+  tlmc playlist LOCAL_DIR
+  tlmc playlist rebuild LOCAL_DIR
+  tlmc playlist delete LOCAL_DIR
   tlmc split LOCAL_DIR
 
 Commands:
-  news    Show the TLMC synchronization log
-  sync    Sync directories that already exist locally from the TLMC repository
-  add     Select new circles/albums with fzf, create them, then sync
-  edit    Select a local circle with fzf and edit its .config
-  delete  Select and delete local circles/albums with fzf
-  split   Split single-FLAC albums with CUE sheets into individual tracks
+  news      Show the TLMC synchronization log
+  sync      Sync directories that already exist locally from the TLMC repository
+  add       Select new circles/albums with fzf, create them, then sync
+  edit      Select a local circle with fzf and edit its .config
+  delete    Select and delete local circles/albums with fzf
+  playlist  Incrementally update one main-content M3U playlist per circle
+  split     Split single-FLAC albums with CUE sheets into individual tracks
 
-Sync options:
-  --delete                 Delete files in selected directories if absent remotely
-  -n, --dry-run            Show what would be transferred without changing files
-  -h, --help               Show command help
+Sync subcommands:
+  delete    Delete files in selected directories if absent remotely
+
+Playlist subcommands:
+  rebuild   Rebuild every playlist without reusing unchanged albums
+  delete    Delete the generated M3U playlist from each circle
+
+Options:
+  -h, --help  Show command help
 
 Each circle stores its sync granularity in CIRCLE/.config:
   granularity=circle       Sync the whole circle (default)
@@ -151,17 +160,13 @@ circle_granularity() {
 }
 
 sync_tlmc() {
-  local delete_flag="" dry_run_flag=""
+  local delete_flag=""
   LOCAL_DIR=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
-    --delete)
+    delete)
       delete_flag="--delete"
-      shift
-      ;;
-    -n | --dry-run)
-      dry_run_flag="--dry-run"
       shift
       ;;
     -h | --help)
@@ -215,12 +220,10 @@ sync_tlmc() {
   echo "Syncing under: $LOCAL_DIR"
   echo "  circle mode: $circle_count circle(s)"
   echo "  album mode:  $album_circle_count circle(s), $album_count album(s)"
-  [ -z "$dry_run_flag" ] || echo "[MODE: DRY RUN]"
   [ -z "$delete_flag" ] || echo "[MODE: DELETE ENABLED]"
 
   local -a rsync_args=(-avz --progress --filter=". $filter_file")
   [ -z "$delete_flag" ] || rsync_args+=("$delete_flag")
-  [ -z "$dry_run_flag" ] || rsync_args+=("$dry_run_flag")
   rsync-ssl "${rsync_args[@]}" "$URL/" "$LOCAL_DIR/"
   status=$?
   rm -f "$filter_file"
@@ -622,6 +625,224 @@ delete_tlmc() {
   done
 }
 
+# Shared media helpers
+
+is_auxiliary_path() {
+  local lower_path="${1,,}"
+  case "$lower_path" in
+  *special* | *postcard* | *contents* | *instrument* | *lyrics* | *scans* | *booklet*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# Playlist
+
+collect_album_playlist_tracks() {
+  local album_dir="$1" path
+  local -a tracks_dirs=()
+
+  while IFS= read -r -d '' path; do
+    is_auxiliary_path "$path" || tracks_dirs+=("$path")
+  done < <(find "$album_dir" -type d -name tracks -print0)
+
+  if [ "${#tracks_dirs[@]}" -gt 0 ]; then
+    for path in "${tracks_dirs[@]}"; do
+      find "$path" -type f -iname '*.flac' -print0
+    done
+    return 0
+  fi
+
+  while IFS= read -r -d '' path; do
+    is_auxiliary_path "$path" || printf '%s\0' "$path"
+  done < <(find "$album_dir" -type f -iname '*.flac' -print0)
+}
+
+playlist_track_metadata() {
+  local track="$1" samples sample_rate title fallback
+  samples=$(metaflac --show-total-samples "$track" 2>/dev/null || true)
+  sample_rate=$(metaflac --show-sample-rate "$track" 2>/dev/null || true)
+  title=$(metaflac --show-tag=TITLE "$track" 2>/dev/null | sed -n '1s/^TITLE=//p')
+  title="${title//$'\r'/}"
+  title="${title//$'\n'/ }"
+
+  if [[ "$samples" =~ ^[0-9]+$ ]] && [[ "$sample_rate" =~ ^[1-9][0-9]*$ ]]; then
+    PLAYLIST_DURATION=$((samples * 1000 / sample_rate))
+  else
+    PLAYLIST_DURATION=-1
+  fi
+  if [ -n "$title" ]; then
+    PLAYLIST_TITLE="$title"
+  else
+    fallback=$(basename "$track")
+    PLAYLIST_TITLE="${fallback%.*}"
+  fi
+}
+
+playlist_album_id() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+playlist_album_fingerprint() {
+  local circle="$1" track_file="$2" state_file="$3"
+  local track relative_track fingerprint
+  : >"$state_file"
+
+  while IFS= read -r -d '' track; do
+    relative_track=$(realpath --relative-to="$circle" "$track") || return 1
+    printf '%s\0' "$relative_track" >>"$state_file"
+    stat --printf='%s\0%y\0%z\0' "$track" >>"$state_file" || return 1
+  done <"$track_file"
+
+  fingerprint=$(sha256sum "$state_file") || return 1
+  printf '%s' "${fingerprint%% *}"
+}
+
+extract_playlist_album_block() {
+  local playlist_file="$1" marker="$2"
+  awk -v marker="$marker" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      if (found && line ~ /^#TLMC-ALBUM / && line != marker) {
+        exit
+      }
+      if (line == marker) {
+        found = 1
+      }
+      if (found) {
+        printf "%s\r\n", line
+      }
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$playlist_file"
+}
+
+playlist_tlmc() {
+  local action="update"
+  LOCAL_DIR=""
+
+  case "${1:-}" in
+  rebuild | delete)
+    action="$1"
+    shift
+    ;;
+  esac
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h | --help)
+      echo "Usage: tlmc playlist [rebuild|delete] LOCAL_DIR"
+      return 0
+      ;;
+    -*) die "unknown playlist option: $1" ;;
+    *)
+      [ -z "$LOCAL_DIR" ] || die "unexpected argument: $1"
+      LOCAL_DIR="$1"
+      shift
+      ;;
+    esac
+  done
+  require_local_dir
+
+  local circle circle_name playlist_name playlist_file temp_file
+  local album album_name album_id fingerprint marker track track_file state_file
+  local relative_track album_track_count track_count circle_count=0
+  local reused_count rebuilt_count total_reused=0 total_rebuilt=0
+  local playlist_work_dir
+  local -a albums=()
+
+  if [ "$action" = "delete" ]; then
+    while IFS= read -r -d '' circle; do
+      circle_name=$(basename "$circle")
+      playlist_name="${circle_name#[}"
+      playlist_name="${playlist_name%]}"
+      playlist_file="$circle/$playlist_name.m3u"
+      if [ -e "$playlist_file" ] || [ -L "$playlist_file" ]; then
+        rm -f -- "$playlist_file"
+        echo "[playlist] deleted: $playlist_file"
+        circle_count=$((circle_count + 1))
+      fi
+    done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+
+    echo "Deleted $circle_count playlist(s)."
+    return 0
+  fi
+
+  command -v metaflac >/dev/null 2>&1 || die "'metaflac' is required."
+
+  playlist_work_dir=$(mktemp -d) || exit 1
+  track_file="$playlist_work_dir/tracks"
+  state_file="$playlist_work_dir/state"
+
+  while IFS= read -r -d '' circle; do
+    circle_name=$(basename "$circle")
+    playlist_name="${circle_name#[}"
+    playlist_name="${playlist_name%]}"
+    playlist_file="$circle/$playlist_name.m3u"
+    temp_file=$(mktemp "$circle/.${playlist_name}.m3u.tmp.XXXXXX") || {
+      rm -rf -- "$playlist_work_dir"
+      return 1
+    }
+    printf '#EXTM3U\r\n' >"$temp_file"
+    track_count=0
+    reused_count=0
+    rebuilt_count=0
+
+    albums=()
+    mapfile -d '' albums < <(find "$circle" -mindepth 1 -maxdepth 1 -type d \
+      ! -name tracks ! -name split ! -name @eaDir -print0 | sort -z)
+    for album in "${albums[@]}"; do
+      collect_album_playlist_tracks "$album" | sort -z >"$track_file"
+      album_track_count=$(tr -cd '\0' <"$track_file" | wc -c)
+      track_count=$((track_count + album_track_count))
+      album_name=$(basename "$album")
+      album_id=$(playlist_album_id "$album_name") || {
+        rm -f "$temp_file"
+        rm -rf -- "$playlist_work_dir"
+        return 1
+      }
+      fingerprint=$(playlist_album_fingerprint "$circle" "$track_file" "$state_file") || {
+        rm -f "$temp_file"
+        rm -rf -- "$playlist_work_dir"
+        return 1
+      }
+      marker="#TLMC-ALBUM $album_id $fingerprint"
+
+      if [ "$action" = "update" ] && [ -f "$playlist_file" ] &&
+        extract_playlist_album_block "$playlist_file" "$marker" >>"$temp_file"; then
+        reused_count=$((reused_count + 1))
+        continue
+      fi
+
+      printf '%s\r\n' "$marker" >>"$temp_file"
+      while IFS= read -r -d '' track; do
+        playlist_track_metadata "$track"
+        relative_track=$(realpath --relative-to="$circle" "$track") || {
+          rm -f "$temp_file"
+          rm -rf -- "$playlist_work_dir"
+          return 1
+        }
+        printf '#EXTINF:%s,%s\r\n%s\r\n' \
+          "$PLAYLIST_DURATION" "$PLAYLIST_TITLE" "$relative_track" >>"$temp_file"
+      done <"$track_file"
+      rebuilt_count=$((rebuilt_count + 1))
+    done
+
+    mv -f "$temp_file" "$playlist_file"
+    echo "[playlist] $playlist_name: $track_count track(s), $reused_count reused, $rebuilt_count rebuilt -> $playlist_file"
+    circle_count=$((circle_count + 1))
+    total_reused=$((total_reused + reused_count))
+    total_rebuilt=$((total_rebuilt + rebuilt_count))
+  done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+
+  rm -rf -- "$playlist_work_dir"
+  echo "Updated $circle_count playlist(s): $total_reused album(s) reused, $total_rebuilt rebuilt."
+}
+
 # Split
 
 # Print "<tracknum>\t<title>" lines from a cue sheet
@@ -681,8 +902,8 @@ find_cue_flac() {
   while IFS= read -r -d '' candidate; do
     flacs+=("$candidate")
     candidate_name=$(basename "$candidate")
-    if [ "${candidate_name%.*}" = "$cue_stem" ] || \
-      [ "$candidate_name" = "$cue_reference" ] || \
+    if [ "${candidate_name%.*}" = "$cue_stem" ] ||
+      [ "$candidate_name" = "$cue_reference" ] ||
       [ "${candidate_name%.*}" = "$cue_reference_stem" ]; then
       printf '%s' "$candidate"
       return 0
@@ -695,14 +916,6 @@ find_cue_flac() {
     return 0
   fi
   return 1
-}
-
-is_auxiliary_cue_path() {
-  local lower_path="${1,,}"
-  case "$lower_path" in
-  *special* | *postcard* | *contents* | *instrument* | *lyrics* | *scans* | *booklet*) return 0 ;;
-  *) return 1 ;;
-  esac
 }
 
 split_cue_image() {
@@ -850,7 +1063,7 @@ split_tlmc() {
     split | tracks | @eaDir) continue ;;
     esac
 
-    if is_auxiliary_cue_path "$album_dir"; then
+    if is_auxiliary_path "$album_dir"; then
       echo "[split-cue] skip (auxiliary content): $cue_file"
       continue
     fi
@@ -929,6 +1142,10 @@ edit)
 delete)
   shift
   delete_tlmc "$@"
+  ;;
+playlist)
+  shift
+  playlist_tlmc "$@"
   ;;
 split)
   shift
