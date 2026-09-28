@@ -662,27 +662,35 @@ sanitize_filename() {
   printf '%s' "$s"
 }
 
-split_cue_album() {
-  local album_dir="$1"
-  local tracks_dir="${album_dir}/tracks"
+find_cue_flac() {
+  local source_cue="$1" allow_single_fallback="$2"
+  local cue_dir cue_name cue_stem candidate candidate_name
+  local -a flacs=()
+  cue_dir=$(dirname "$source_cue")
+  cue_name=$(basename "$source_cue")
+  cue_stem="${cue_name%.*}"
 
-  local -a flacs=() cues=()
-  local f
-  while IFS= read -r -d '' f; do
-    [ -f "$f" ] || continue
-    flacs+=("$f")
-  done < <(find "$album_dir" -maxdepth 1 -mindepth 1 -type f -iname "*.flac" -print0)
-  while IFS= read -r -d '' f; do
-    [ -f "$f" ] || continue
-    cues+=("$f")
-  done < <(find "$album_dir" -maxdepth 1 -mindepth 1 -type f -iname "*.cue" -print0)
+  while IFS= read -r -d '' candidate; do
+    flacs+=("$candidate")
+    candidate_name=$(basename "$candidate")
+    if [ "${candidate_name%.*}" = "$cue_stem" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(find "$cue_dir" -maxdepth 1 -mindepth 1 -type f -iname '*.flac' -print0)
 
-  if [ "${#flacs[@]}" -ne 1 ] || [ "${#cues[@]}" -ne 1 ]; then
+  # Legacy-encoded CUE sheets may not match their UTF-8 filesystem name.
+  if [ "$allow_single_fallback" -eq 1 ] && [ "${#flacs[@]}" -eq 1 ]; then
+    printf '%s' "${flacs[0]}"
     return 0
   fi
+  return 1
+}
 
-  local source_flac="${flacs[0]}"
-  local source_cue="${cues[0]}"
+split_cue_image() {
+  local source_cue="$1" source_flac="$2" tracks_dir="$3"
+  local album_dir
+  album_dir=$(dirname "$source_cue")
 
   # A single CUE and FLAC in the same directory are an unambiguous pair.
   # Do not compare their names: older CUE sheets may use a legacy encoding
@@ -699,7 +707,7 @@ split_cue_album() {
     existing_count=$(find "$tracks_dir" -maxdepth 1 -type f -name '*.flac' | wc -l)
   fi
   if [ "$existing_count" -eq "$cue_track_count" ] && [ "$cue_track_count" -gt 0 ]; then
-    echo "[split-cue] skip (already split): $album_dir"
+    echo "[split-cue] skip (already split): $source_cue"
     return 0
   fi
   if [ "$existing_count" -gt 0 ]; then
@@ -707,7 +715,7 @@ split_cue_album() {
     find "$tracks_dir" -maxdepth 1 -type f -name '*.flac' -delete
   fi
 
-  echo "[split-cue] $album_dir"
+  echo "[split-cue] $source_cue"
 
   # Extract cover art to a temp file (metaflac --import-picture-from needs a file)
   local cover_file=""
@@ -815,17 +823,31 @@ split_tlmc() {
     fi
   done
 
-  local failures=0 album_dir cue_file
-  local -A visited=()
+  local failures=0 album_dir cue_file source_flac tracks_dir
+  local cue_count cue_name cue_stem safe_stem
   echo "Splitting single-FLAC albums under: $LOCAL_DIR"
   while IFS= read -r -d '' cue_file; do
     album_dir=$(dirname "$cue_file")
-    [ -z "${visited["$album_dir"]+set}" ] || continue
-    visited["$album_dir"]=1
     case "$(basename "$album_dir")" in
     split | tracks | @eaDir) continue ;;
     esac
-    split_cue_album "$album_dir" || failures=$((failures + 1))
+
+    cue_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.cue' | wc -l)
+    if ! source_flac=$(find_cue_flac "$cue_file" "$((cue_count == 1))"); then
+      echo "[split-cue] ERROR: no unambiguous FLAC match for $cue_file" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+
+    if [ "$cue_count" -eq 1 ]; then
+      tracks_dir="$album_dir/tracks"
+    else
+      cue_name=$(basename "$cue_file")
+      cue_stem="${cue_name%.*}"
+      safe_stem=$(sanitize_filename "$cue_stem")
+      tracks_dir="$album_dir/tracks/$safe_stem"
+    fi
+    split_cue_image "$cue_file" "$source_flac" "$tracks_dir" || failures=$((failures + 1))
   done < <(find "$LOCAL_DIR" \
     -type d \( -name tracks -o -name split -o -name @eaDir \) -prune -o \
     -type f -iname '*.cue' -print0)
