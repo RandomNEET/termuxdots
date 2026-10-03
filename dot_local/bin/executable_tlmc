@@ -12,10 +12,10 @@ Usage:
   tlmc add LOCAL_DIR
   tlmc edit LOCAL_DIR
   tlmc delete LOCAL_DIR
-  tlmc playlist LOCAL_DIR
-  tlmc playlist rebuild LOCAL_DIR
-  tlmc playlist delete LOCAL_DIR
-  tlmc split LOCAL_DIR
+  tlmc playlist LIBRARY_OR_CIRCLE
+  tlmc playlist rebuild LIBRARY_OR_CIRCLE
+  tlmc playlist delete LIBRARY_OR_CIRCLE
+  tlmc split LIBRARY_OR_CIRCLE
 
 Commands:
   news      Show the TLMC synchronization log
@@ -697,6 +697,26 @@ playlist_album_fingerprint() {
   printf '%s' "${fingerprint%% *}"
 }
 
+circle_fingerprint() {
+  local circle="$1" state_file="$2"
+  local directory relative_directory fingerprint
+  : >"$state_file"
+
+  while IFS= read -r -d '' directory; do
+    relative_directory=$(realpath --relative-to="$circle" "$directory") || return 1
+    printf '%s\0' "$relative_directory" >>"$state_file"
+    stat --printf='%y\0%z\0' "$directory" >>"$state_file" || return 1
+  done < <(find "$circle" -mindepth 1 -type d \
+    ! -name @eaDir -print0 | sort -z)
+
+  fingerprint=$(sha256sum "$state_file") || return 1
+  printf '%s' "${fingerprint%% *}"
+}
+
+playlist_stored_circle_fingerprint() {
+  sed -n 's/\r$//; s/^#TLMC-CIRCLE //p' "$1" | head -n 1
+}
+
 extract_playlist_album_block() {
   local playlist_file="$1" marker="$2"
   awk -v marker="$marker" '
@@ -735,7 +755,7 @@ playlist_tlmc() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
     -h | --help)
-      echo "Usage: tlmc playlist [rebuild|delete] LOCAL_DIR"
+      echo "Usage: tlmc playlist [rebuild|delete] LIBRARY_OR_CIRCLE"
       return 0
       ;;
     -*) die "unknown playlist option: $1" ;;
@@ -750,13 +770,20 @@ playlist_tlmc() {
 
   local circle circle_name playlist_name playlist_file temp_file
   local album album_name album_id fingerprint marker track track_file state_file
+  local circle_fingerprint stored_circle_fingerprint
   local relative_track album_track_count track_count circle_count=0
   local reused_count rebuilt_count total_reused=0 total_rebuilt=0
-  local playlist_work_dir
-  local -a albums=()
+  local skipped_count=0 playlist_work_dir
+  local -a albums=() circles=()
+
+  if [ -f "$LOCAL_DIR/.config" ]; then
+    circles=("$LOCAL_DIR")
+  else
+    mapfile -d '' circles < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+  fi
 
   if [ "$action" = "delete" ]; then
-    while IFS= read -r -d '' circle; do
+    for circle in "${circles[@]}"; do
       circle_name=$(basename "$circle")
       playlist_name="${circle_name#[}"
       playlist_name="${playlist_name%]}"
@@ -766,7 +793,7 @@ playlist_tlmc() {
         echo "[playlist] deleted: $playlist_file"
         circle_count=$((circle_count + 1))
       fi
-    done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    done
 
     echo "Deleted $circle_count playlist(s)."
     return 0
@@ -778,16 +805,32 @@ playlist_tlmc() {
   track_file="$playlist_work_dir/tracks"
   state_file="$playlist_work_dir/state"
 
-  while IFS= read -r -d '' circle; do
+  for circle in "${circles[@]}"; do
     circle_name=$(basename "$circle")
     playlist_name="${circle_name#[}"
     playlist_name="${playlist_name%]}"
     playlist_file="$circle/$playlist_name.m3u"
+    circle_fingerprint=$(circle_fingerprint "$circle" "$state_file") || {
+      rm -rf -- "$playlist_work_dir"
+      return 1
+    }
+    stored_circle_fingerprint=""
+    if [ -f "$playlist_file" ]; then
+      stored_circle_fingerprint=$(playlist_stored_circle_fingerprint "$playlist_file")
+    fi
+    if [ "$action" = "update" ] && [ -n "$stored_circle_fingerprint" ] &&
+      [ "$circle_fingerprint" = "$stored_circle_fingerprint" ]; then
+      echo "[playlist] $playlist_name: unchanged"
+      circle_count=$((circle_count + 1))
+      skipped_count=$((skipped_count + 1))
+      continue
+    fi
+
     temp_file=$(mktemp "$circle/.${playlist_name}.m3u.tmp.XXXXXX") || {
       rm -rf -- "$playlist_work_dir"
       return 1
     }
-    printf '#EXTM3U\r\n' >"$temp_file"
+    printf '#EXTM3U\r\n#TLMC-CIRCLE %s\r\n' "$circle_fingerprint" >"$temp_file"
     track_count=0
     reused_count=0
     rebuilt_count=0
@@ -837,10 +880,10 @@ playlist_tlmc() {
     circle_count=$((circle_count + 1))
     total_reused=$((total_reused + reused_count))
     total_rebuilt=$((total_rebuilt + rebuilt_count))
-  done < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+  done
 
   rm -rf -- "$playlist_work_dir"
-  echo "Updated $circle_count playlist(s): $total_reused album(s) reused, $total_rebuilt rebuilt."
+  echo "Checked $circle_count playlist(s): $skipped_count unchanged, $total_reused album(s) reused, $total_rebuilt rebuilt."
 }
 
 # Split
@@ -1028,12 +1071,33 @@ split_cue_image() {
   return 0
 }
 
+stored_split_fingerprint() {
+  sed -n 's/^split_fingerprint=//p' "$1/.config" | tail -n 1
+}
+
+write_split_fingerprint() {
+  local circle="$1" fingerprint="$2" config temp_file
+  config="$circle/.config"
+  if [ ! -e "$config" ]; then
+    write_circle_config "$circle" circle || return 1
+  fi
+  [ -f "$config" ] || return 1
+
+  temp_file=$(mktemp "$circle/.config.tmp.XXXXXX") || return 1
+  sed '/^split_fingerprint=/d' "$config" >"$temp_file" || {
+    rm -f "$temp_file"
+    return 1
+  }
+  printf 'split_fingerprint=%s\n' "$fingerprint" >>"$temp_file"
+  mv -f "$temp_file" "$config"
+}
+
 split_tlmc() {
   LOCAL_DIR=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
     -h | --help)
-      echo "Usage: tlmc split LOCAL_DIR"
+      echo "Usage: tlmc split LIBRARY_OR_CIRCLE"
       return 0
       ;;
     -*) die "unknown split option: $1" ;;
@@ -1054,51 +1118,91 @@ split_tlmc() {
     fi
   done
 
-  local failures=0 album_dir cue_file source_flac tracks_dir
+  local failures=0 circle_failures album_dir cue_file source_flac tracks_dir
   local cue_count cue_file_count flac_count cue_name cue_stem safe_stem
+  local circle fingerprint stored_fingerprint state_file skipped_count=0 circle_count=0
+  local -a circles=()
+
+  if [ -f "$LOCAL_DIR/.config" ]; then
+    circles=("$LOCAL_DIR")
+  else
+    mapfile -d '' circles < <(find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+  fi
+  state_file=$(mktemp) || exit 1
+
   echo "Splitting single-FLAC albums under: $LOCAL_DIR"
-  while IFS= read -r -d '' cue_file; do
-    album_dir=$(dirname "$cue_file")
-    case "$(basename "$album_dir")" in
-    split | tracks | @eaDir) continue ;;
-    esac
-
-    if is_auxiliary_path "$album_dir"; then
-      echo "[split-cue] skip (auxiliary content): $cue_file"
+  for circle in "${circles[@]}"; do
+    fingerprint=$(circle_fingerprint "$circle" "$state_file") || {
+      rm -f "$state_file"
+      return 1
+    }
+    stored_fingerprint=$(stored_split_fingerprint "$circle")
+    if [ -n "$stored_fingerprint" ] && [ "$fingerprint" = "$stored_fingerprint" ]; then
+      echo "[split] $(basename "$circle"): unchanged"
+      skipped_count=$((skipped_count + 1))
+      circle_count=$((circle_count + 1))
       continue
     fi
 
-    cue_file_count=$(grep -cE '^[[:space:]]*FILE[[:space:]]+' "$cue_file")
-    if [ "$cue_file_count" -ne 1 ]; then
-      echo "[split-cue] skip (not a single-image CUE): $cue_file"
-      continue
-    fi
+    circle_failures=0
+    while IFS= read -r -d '' cue_file; do
+      album_dir=$(dirname "$cue_file")
+      case "$(basename "$album_dir")" in
+      split | tracks | @eaDir) continue ;;
+      esac
 
-    cue_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.cue' | wc -l)
-    if ! source_flac=$(find_cue_flac "$cue_file" "$((cue_count == 1))"); then
-      flac_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.flac' | wc -l)
-      if [ "$flac_count" -gt 1 ]; then
-        echo "[split-cue] skip (no matching image FLAC): $cue_file"
-      else
-        echo "[split-cue] ERROR: no FLAC match for $cue_file" >&2
-        failures=$((failures + 1))
+      if is_auxiliary_path "$album_dir"; then
+        echo "[split-cue] skip (auxiliary content): $cue_file"
+        continue
       fi
-      continue
-    fi
 
-    if [ "$cue_count" -eq 1 ]; then
-      tracks_dir="$album_dir/tracks"
-    else
-      cue_name=$(basename "$cue_file")
-      cue_stem="${cue_name%.*}"
-      safe_stem=$(sanitize_filename "$cue_stem")
-      tracks_dir="$album_dir/tracks/$safe_stem"
+      cue_file_count=$(grep -cE '^[[:space:]]*FILE[[:space:]]+' "$cue_file")
+      if [ "$cue_file_count" -ne 1 ]; then
+        echo "[split-cue] skip (not a single-image CUE): $cue_file"
+        continue
+      fi
+
+      cue_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.cue' | wc -l)
+      if ! source_flac=$(find_cue_flac "$cue_file" "$((cue_count == 1))"); then
+        flac_count=$(find "$album_dir" -maxdepth 1 -type f -iname '*.flac' | wc -l)
+        if [ "$flac_count" -gt 1 ]; then
+          echo "[split-cue] skip (no matching image FLAC): $cue_file"
+        else
+          echo "[split-cue] ERROR: no FLAC match for $cue_file" >&2
+          circle_failures=$((circle_failures + 1))
+        fi
+        continue
+      fi
+
+      if [ "$cue_count" -eq 1 ]; then
+        tracks_dir="$album_dir/tracks"
+      else
+        cue_name=$(basename "$cue_file")
+        cue_stem="${cue_name%.*}"
+        safe_stem=$(sanitize_filename "$cue_stem")
+        tracks_dir="$album_dir/tracks/$safe_stem"
+      fi
+      split_cue_image "$cue_file" "$source_flac" "$tracks_dir" || circle_failures=$((circle_failures + 1))
+    done < <(find "$circle" \
+      -type d \( -name tracks -o -name split -o -name @eaDir \) -prune -o \
+      -type f -iname '*.cue' -print0)
+
+    if [ "$circle_failures" -eq 0 ]; then
+      fingerprint=$(circle_fingerprint "$circle" "$state_file") || {
+        rm -f "$state_file"
+        return 1
+      }
+      write_split_fingerprint "$circle" "$fingerprint" || {
+        rm -f "$state_file"
+        return 1
+      }
     fi
-    split_cue_image "$cue_file" "$source_flac" "$tracks_dir" || failures=$((failures + 1))
-  done < <(find "$LOCAL_DIR" \
-    -type d \( -name tracks -o -name split -o -name @eaDir \) -prune -o \
-    -type f -iname '*.cue' -print0)
-  echo "Split pass finished."
+    failures=$((failures + circle_failures))
+    circle_count=$((circle_count + 1))
+  done
+
+  rm -f "$state_file"
+  echo "Split pass finished: $circle_count circle(s) checked, $skipped_count unchanged."
   [ "$failures" -eq 0 ] || die "$failures album(s) failed to split."
 }
 
